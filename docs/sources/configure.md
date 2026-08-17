@@ -326,6 +326,8 @@ jsonData:
       onMissing: reject             # "reject" (default) or "empty"
 ```
 
+Grafana does **not** have to be configured to use JWT for user authentication (`[auth.jwt]`) in order to bind an enforced setting to an external IdP JWT. Enforced-settings JWT verification is entirely independent of Grafana's login-time JWT pipeline: as long as the token reaches the plugin in a forwarded header (typically `X-Id-Token` via **Forward Grafana HTTP Headers**, or a custom header), the plugin will parse and — with `jwtVerify: jwks` — cryptographically verify it against the JWKS URL you configure here, regardless of how users authenticate to Grafana itself.
+
 ##### Choosing the token header
 
 Different token headers carry different sets of claims. Choose the one whose claim you actually need:
