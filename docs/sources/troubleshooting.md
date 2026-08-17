@@ -281,7 +281,7 @@ Query rejected — enforced settings or read-only mode
 
 **Solution:** This is intentional behaviour. If a user legitimately needs to tune a specific setting per query (for example, `max_threads`), ask an operator to mark that setting as `CHANGEABLE_IN_READONLY` in the server-side settings profile for the Grafana user. Do **not** apply `CHANGEABLE_IN_READONLY` to any setting that is also marked **Enforced** in the data source, as that would allow users to override the enforced value.
 
-For configuration details, refer to [Enforcing server-side settings (multi-tenancy)](/docs/plugins/grafana-clickhouse-datasource/<CLICKHOUSE_PLUGIN_VERSION>/configure/#enforcing-server-side-settings-multi-tenancy).
+For configuration details, refer to [Enforcing server-side settings](/docs/plugins/grafana-clickhouse-datasource/<CLICKHOUSE_PLUGIN_VERSION>/configure/#enforcing-server-side-settings).
 
 ---
 
@@ -329,7 +329,7 @@ Health check fails — plugin cannot inject enforced settings (connecting user i
 1. Configure the connecting ClickHouse user's profile with `readonly = 0` or `readonly = 2` at the server level.
 2. The plugin will apply `readonly = 1` per-query automatically when enforced settings or the **Enforce read-only on all queries** toggle are enabled.
 
-For setup details, refer to [Enforcing server-side settings (multi-tenancy)](/docs/plugins/grafana-clickhouse-datasource/<CLICKHOUSE_PLUGIN_VERSION>/configure/#enforcing-server-side-settings-multi-tenancy).
+For setup details, refer to [Enforcing server-side settings](/docs/plugins/grafana-clickhouse-datasource/<CLICKHOUSE_PLUGIN_VERSION>/configure/#enforcing-server-side-settings).
 
 ---
 

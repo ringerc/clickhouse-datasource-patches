@@ -63,7 +63,7 @@ After configuring the data source, you can:
 - Use [Explore](https://grafana.com/docs/grafana/latest/explore/) to query data without building a dashboard
 - Add [Transformations](https://grafana.com/docs/grafana/latest/panels/transformations/) to manipulate query results
 - Set up [Alerting](https://grafana.com/docs/grafana/latest/alerting/) rules
-- Enforce ClickHouse server-side settings — such as a multi-tenant filter variable — that users cannot override in their SQL. See [Enforcing server-side settings (multi-tenancy)](configure/#enforcing-server-side-settings-multi-tenancy).
+- Enforce ClickHouse server-side settings — such as a multi-tenant filter variable — that users cannot override in their SQL. See [Enforcing server-side settings](configure/#enforcing-server-side-settings).
 
 ## Pre-built dashboards
 
