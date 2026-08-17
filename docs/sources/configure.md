@@ -223,7 +223,7 @@ Every enforced setting has a **Source** that determines where the per-query valu
 | ----------- | ----------------------- | ------------------------------------------------- | ------------ | ----------------------------------------------------------- | -------------------------------------------------------------------------------- |
 | **Static**  | `static` (or omitted)   | The **Value** field in the datasource config      | No           | Whoever can edit the datasource config (org admin)          | One value shared by every query on this datasource instance                      |
 | **Request header** | `header`         | A named HTTP request header on the incoming query | Yes          | A trusted upstream proxy that stamps the header             | Per-user or per-tenant values injected by an identity-aware gateway              |
-| **JWT claim** | `jwt`                 | A claim inside a JWT carried by a named header    | Yes          | The JWT issuer (Grafana itself, or an external IdP via JWKS)| Per-user or per-tenant values whose integrity is cryptographically verifiable    |
+| **JWT claim** | `jwt`                 | A claim inside a JWT carried by a named header    | Yes          | The JWT issuer (Grafana itself, or an external identity provider (IdP) via JWKS)| Per-user or per-tenant values whose integrity is cryptographically verifiable    |
 
 The remainder of this section describes each source in detail, then summarizes the global Grafana and per-datasource settings that must be aligned for header- and JWT-based bindings to work.
 

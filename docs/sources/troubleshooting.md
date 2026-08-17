@@ -797,7 +797,7 @@ query rejected: jwt signature verification failed for setting 'custom_visible_te
 
 The sub-error indicates the specific failure. Common sub-errors and their remediation:
 
-- **`unknown kid` / `no matching key`** — The JWT's `kid` header does not match any key in the JWKS response. The signing key may have been rotated. Check that the `jwtJwksUrl` points to the current JWKS endpoint and that the IdP has published the new key. The plugin fetches the JWKS on each verification; if the endpoint is reachable, key rotation is picked up automatically.
+- **`unknown kid` / `no matching key`** — The JWT's `kid` header does not match any key in the JWKS response. The signing key may have been rotated. Check that the `jwtJwksUrl` points to the current JWKS endpoint and that the identity provider (IdP) has published the new key. The plugin fetches the JWKS on each verification; if the endpoint is reachable, key rotation is picked up automatically.
 
 - **`token is expired`** — The JWT's `exp` claim is in the past. This can occur if Grafana is not refreshing forwarded tokens or if the token lifetime is very short. Check the token TTL on the issuing system.
 
