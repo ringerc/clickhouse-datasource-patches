@@ -358,6 +358,10 @@ The **Verify** mode controls whether the plugin checks the token's signature:
 Use `jwtVerify: jwks` whenever the token comes from an external IdP, or whenever you want defence-in-depth against key rotation, revocation, and in-transit tampering between Grafana and out-of-process plugin binaries. Verify `X-Grafana-Id` against Grafana's `/api/signing-keys/keys` endpoint (`https://<your-grafana>/api/signing-keys/keys`).
 
 {{< admonition type="note" >}}
+**JWT verification is independent of Grafana's login-time JWT auth.** Both `jwtVerify: none` and `jwtVerify: jwks` operate entirely inside the plugin: `none` parses the token without a signature check, and `jwks` fetches the key set from `jwtJwksUrl` and verifies against it (plus optional `iss`/`aud` checks). Neither mode consults Grafana's `[auth.jwt]` configuration or its login pipeline, so passing verification here does **not** imply Grafana would accept the same token to log a user in. Conversely, you can bind an enforced setting to a JWT (for example a forwarded OIDC ID token) even when Grafana is not configured to use JWT for login at all — the user just needs to be signed in to Grafana by any means, and a header carrying the token needs to reach the plugin.
+{{< /admonition >}}
+
+{{< admonition type="note" >}}
 **Freshness under `jwtVerify: none`.** Grafana validates upstream OAuth tokens **only at login**; it does not re-verify or re-mint them at query time. Forwarded IdP tokens (in `Authorization`, `X-Id-Token`, or any custom header carrying an upstream token) are read from Grafana's cache and can outlive their `exp` by hours. To prevent a stale claim silently binding to a server-side setting, the plugin enforces the `exp` claim (with 60 s leeway) even under `jwtVerify: none`, **except** when the token comes from `X-Grafana-Id` — which Grafana re-mints per request and is Grafana's concern to keep fresh. An expired token is treated as if the value were absent, so the `onMissing` policy (`reject` or `empty`) decides the outcome.
 {{< /admonition >}}
 
