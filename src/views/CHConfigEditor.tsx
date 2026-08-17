@@ -16,11 +16,16 @@ import {
   TextLink,
   Tooltip,
   Icon,
+  Checkbox,
+  Select,
 } from '@grafana/ui';
 import { CertificationKey } from '../components/ui/CertificationKey';
 import {
   CHConfig,
   CHCustomSetting,
+  CHCustomSettingSource,
+  CHCustomSettingOnMissing,
+  CHCustomSettingJWTVerify,
   CHSecureConfig,
   CHLogsConfig,
   Protocol,
@@ -40,6 +45,7 @@ import { LogsConfig } from 'components/configEditor/LogsConfig';
 import { TracesConfig } from 'components/configEditor/TracesConfig';
 import { HttpHeadersConfig } from 'components/configEditor/HttpHeadersConfig';
 import allLabels from '../labels';
+import { selectors } from '../selectors';
 import { createValidationAPI, onHttpHeadersChange, useConfigDefaults } from './CHConfigEditorHooks';
 import { AliasTableConfig } from '../components/configEditor/AliasTableConfig';
 import * as trackingV1 from './trackingV1';
@@ -149,6 +155,7 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
       | 'enableSecureSocksProxy'
       | 'forwardGrafanaHeaders'
       | 'enableRowLimit'
+      | 'enforceReadOnly'
       | 'hideTableNameInAdhocFilters'
     >,
     value: boolean
@@ -212,7 +219,9 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
       ...options,
       jsonData: {
         ...options.jsonData,
-        customSettings: customSettings.filter((s) => !!s.setting && !!s.value),
+        customSettings: customSettings.filter(
+          (s) => !!s.setting && (!!s.value || (s.enforced && s.source === 'header' && !!s.headerName) || (s.enforced && s.source === 'jwt' && !!s.jwtClaim))
+        ),
       },
     });
   };
@@ -256,6 +265,13 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
   };
 
   const [customSettings, setCustomSettings] = useState(jsonData.customSettings || []);
+
+  // True when at least one custom setting row has enforced=true; drives the enforceReadOnly toggle state.
+  const anyEnforced = customSettings.some((s) => s.enforced);
+  // True when any enforced row uses source=header; drives the warning banner.
+  const anyHeaderSource = customSettings.some((s) => s.enforced && s.source === 'header');
+  // True when any enforced row uses source=jwt; drives the info banner.
+  const anyJWTSource = customSettings.some((s) => s.enforced && s.source === 'jwt');
 
   const hasAdditionalSettings = Boolean(
     window.location.hash || // if trying to link to section on page, open all settings (React breaks this?)
@@ -930,16 +946,55 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
               </Field>
             )}
             <ConfigSubSection title="Custom Settings">
-              {customSettings.map(({ setting, value }, i) => {
+              <Alert title="" severity="info">
+                <ul style={{ margin: 0, paddingLeft: '1.25em' }}>
+                  <li>Enabling read-only enforcement blocks INSERT and DDL queries from Grafana.</li>
+                  <li>
+                    Enforced settings <strong>must NOT</strong> be marked{' '}
+                    <code>CHANGEABLE_IN_READONLY</code> on the ClickHouse server — doing so would let
+                    users override them and break the enforcement guarantee.
+                  </li>
+                  <li>
+                    Use ClickHouse row policies with{' '}
+                    <code>{`getSetting('custom_x')`}</code> to gate data access on enforced settings.
+                  </li>
+                </ul>
+              </Alert>
+              {anyHeaderSource && (
+                <Alert
+                  title="Header-sourced enforced settings require a trusted upstream proxy."
+                  severity="warning"
+                  data-testid={selectors.components.Config.CustomSettingsConfig.headerWarningBanner}
+                >
+                  The header value must be set by a trusted proxy on every request. If the proxy does not
+                  unconditionally overwrite the header, browser-supplied values will reach ClickHouse. Grafana
+                  must also be configured to forward this header to backend plugins.
+                </Alert>
+              )}
+              {anyJWTSource && (
+                <Alert
+                  title={labels.customSettings.jwtInfoBanner.title}
+                  severity="info"
+                  data-testid={selectors.components.Config.CustomSettingsConfig.jwtInfoBanner}
+                >
+                  {labels.customSettings.jwtInfoBanner.message}
+                </Alert>
+              )}
+              {customSettings.map(({ setting, value, enforced, source, headerName, onMissing, jwtHeaderName, jwtClaim, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience }, i) => {
+                const effectiveSource: CHCustomSettingSource = source || 'static';
+                const isHeader = enforced && effectiveSource === 'header';
+                const isJWT = enforced && effectiveSource === 'jwt';
+                const effectiveJwtVerify: CHCustomSettingJWTVerify = jwtVerify || 'none';
+                const csLabels = labels.customSettings;
                 return (
-                  <Stack key={i} direction="row">
+                  <Stack key={i} direction="row" alignItems="flex-end" wrap>
                     <Field label={`Setting`} aria-label={`Setting`}>
                       <Input
                         value={setting}
                         placeholder={'Setting'}
                         onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
                           let newSettings = customSettings.concat();
-                          newSettings[i] = { setting: changeEvent.target.value, value };
+                          newSettings[i] = { setting: changeEvent.target.value, value, enforced, source, headerName, onMissing, jwtHeaderName, jwtClaim, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
                           setCustomSettings(newSettings);
                         }}
                         onBlur={() => {
@@ -948,20 +1003,311 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
                         }}
                       ></Input>
                     </Field>
-                    <Field label={'Value'} aria-label={`Value`}>
-                      <Input
-                        value={value}
-                        placeholder={'Value'}
+                    {(isHeader || isJWT) ? (
+                      <Field label={'Value'} aria-label={`Value`}>
+                        <Input
+                          value=""
+                          placeholder={isJWT ? '(from JWT claim)' : '(from header)'}
+                          disabled
+                        ></Input>
+                      </Field>
+                    ) : (
+                      <Field label={'Value'} aria-label={`Value`}>
+                        <Input
+                          value={value}
+                          placeholder={'Value'}
+                          onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
+                            let newSettings = customSettings.concat();
+                            newSettings[i] = { setting, value: changeEvent.target.value, enforced, source, headerName, onMissing };
+                            setCustomSettings(newSettings);
+                          }}
+                          onBlur={() => {
+                            onCustomSettingsChange(customSettings);
+                          }}
+                        ></Input>
+                      </Field>
+                    )}
+                    <Field
+                      label={
+                        <Tooltip content="Send with readonly=1 so the user's SQL cannot override it.">
+                          <span>Enforced</span>
+                        </Tooltip>
+                      }
+                      aria-label={`Enforced`}
+                    >
+                      <Checkbox
+                        value={enforced || false}
                         onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
                           let newSettings = customSettings.concat();
-                          newSettings[i] = { setting, value: changeEvent.target.value };
+                          newSettings[i] = { setting, value, enforced: changeEvent.target.checked, source, headerName, onMissing };
                           setCustomSettings(newSettings);
+                          onCustomSettingsChange(newSettings);
                         }}
-                        onBlur={() => {
-                          onCustomSettingsChange(customSettings);
-                        }}
-                      ></Input>
+                      />
                     </Field>
+                    {enforced && (
+                      <Field
+                        label={
+                          <Tooltip content={csLabels.source.tooltip}>
+                            <span>{csLabels.source.label}</span>
+                          </Tooltip>
+                        }
+                        aria-label={csLabels.source.label}
+                      >
+                        <Select<CHCustomSettingSource>
+                          options={[
+                            { label: csLabels.source.staticOption, value: 'static' },
+                            { label: csLabels.source.headerOption, value: 'header' },
+                            { label: csLabels.source.jwtOption, value: 'jwt' },
+                          ]}
+                          value={effectiveSource}
+                          data-testid={selectors.components.Config.CustomSettingsConfig.sourceSelect}
+                          onChange={(selected) => {
+                            const newSource = selected.value as CHCustomSettingSource;
+                            let newSettings = customSettings.concat();
+                            if (newSource === 'header') {
+                              // switching to header: clear value and jwt fields
+                              newSettings[i] = { setting, value: '', enforced, source: newSource, headerName, onMissing };
+                            } else if (newSource === 'jwt') {
+                              // switching to jwt: clear value and headerName
+                              newSettings[i] = { setting, value: '', enforced, source: newSource, onMissing, jwtHeaderName, jwtClaim, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
+                            } else {
+                              // switching to static: clear headerName, onMissing, and all jwt fields
+                              newSettings[i] = { setting, value, enforced, source: newSource };
+                            }
+                            setCustomSettings(newSettings);
+                            onCustomSettingsChange(newSettings);
+                          }}
+                          width={18}
+                        />
+                      </Field>
+                    )}
+                    {isHeader && (
+                      <Field
+                        label={
+                          <Tooltip content={csLabels.headerName.tooltip}>
+                            <span>{csLabels.headerName.label}</span>
+                          </Tooltip>
+                        }
+                        aria-label={csLabels.headerName.label}
+                      >
+                        <Input
+                          value={headerName || ''}
+                          placeholder={csLabels.headerName.placeholder}
+                          data-testid={selectors.components.Config.CustomSettingsConfig.headerNameInput}
+                          onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
+                            let newSettings = customSettings.concat();
+                            newSettings[i] = { setting, value: '', enforced, source: effectiveSource, headerName: changeEvent.target.value, onMissing };
+                            setCustomSettings(newSettings);
+                          }}
+                          onBlur={() => {
+                            onCustomSettingsChange(customSettings);
+                          }}
+                        ></Input>
+                      </Field>
+                    )}
+                    {isHeader && (
+                      <Field
+                        label={
+                          <Tooltip content={csLabels.onMissing.tooltip}>
+                            <span>{csLabels.onMissing.label}</span>
+                          </Tooltip>
+                        }
+                        aria-label={csLabels.onMissing.label}
+                      >
+                        <Select<CHCustomSettingOnMissing>
+                          options={[
+                            { label: csLabels.onMissing.rejectOption, value: 'reject' },
+                            { label: csLabels.onMissing.emptyOption, value: 'empty' },
+                          ]}
+                          value={(onMissing as CHCustomSettingOnMissing) || 'reject'}
+                          data-testid={selectors.components.Config.CustomSettingsConfig.onMissingSelect}
+                          onChange={(selected) => {
+                            let newSettings = customSettings.concat();
+                            newSettings[i] = { setting, value: '', enforced, source: effectiveSource, headerName, onMissing: selected.value as CHCustomSettingOnMissing };
+                            setCustomSettings(newSettings);
+                            onCustomSettingsChange(newSettings);
+                          }}
+                          width={18}
+                        />
+                      </Field>
+                    )}
+                    {isJWT && (
+                      <>
+                        <Field
+                          label={
+                            <Tooltip content={csLabels.jwtTokenHeaderInput.tooltip}>
+                              <span>{csLabels.jwtTokenHeaderInput.label}</span>
+                            </Tooltip>
+                          }
+                          aria-label={csLabels.jwtTokenHeaderInput.label}
+                        >
+                          <Input
+                            value={jwtHeaderName || ''}
+                            placeholder={csLabels.jwtTokenHeaderInput.placeholder}
+                            data-testid={selectors.components.Config.CustomSettingsConfig.jwtTokenHeaderInput}
+                            onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
+                              let newSettings = customSettings.concat();
+                              newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName: changeEvent.target.value, jwtClaim, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
+                              setCustomSettings(newSettings);
+                            }}
+                            onBlur={() => { onCustomSettingsChange(customSettings); }}
+                          ></Input>
+                        </Field>
+                        <Field
+                          label={
+                            <Tooltip content={csLabels.jwtClaimPathInput.tooltip}>
+                              <span>{csLabels.jwtClaimPathInput.label}</span>
+                            </Tooltip>
+                          }
+                          aria-label={csLabels.jwtClaimPathInput.label}
+                        >
+                          <Input
+                            value={jwtClaim || ''}
+                            placeholder={csLabels.jwtClaimPathInput.placeholder}
+                            data-testid={selectors.components.Config.CustomSettingsConfig.jwtClaimPathInput}
+                            onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
+                              let newSettings = customSettings.concat();
+                              newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaim: changeEvent.target.value, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
+                              setCustomSettings(newSettings);
+                            }}
+                            onBlur={() => { onCustomSettingsChange(customSettings); }}
+                          ></Input>
+                        </Field>
+                        <Field
+                          label={
+                            <Tooltip content={csLabels.jwtArrayJoinInput.tooltip}>
+                              <span>{csLabels.jwtArrayJoinInput.label}</span>
+                            </Tooltip>
+                          }
+                          aria-label={csLabels.jwtArrayJoinInput.label}
+                        >
+                          <Input
+                            value={jwtClaimJoin || ''}
+                            placeholder={csLabels.jwtArrayJoinInput.placeholder}
+                            data-testid={selectors.components.Config.CustomSettingsConfig.jwtArrayJoinInput}
+                            onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
+                              let newSettings = customSettings.concat();
+                              newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaim, jwtClaimJoin: changeEvent.target.value, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
+                              setCustomSettings(newSettings);
+                            }}
+                            onBlur={() => { onCustomSettingsChange(customSettings); }}
+                          ></Input>
+                        </Field>
+                        <Field
+                          label={
+                            <Tooltip content={csLabels.jwtVerifySelect.tooltip}>
+                              <span>{csLabels.jwtVerifySelect.label}</span>
+                            </Tooltip>
+                          }
+                          aria-label={csLabels.jwtVerifySelect.label}
+                        >
+                          <Select<CHCustomSettingJWTVerify>
+                            options={[
+                              { label: csLabels.jwtVerifySelect.noneOption, value: 'none' },
+                              { label: csLabels.jwtVerifySelect.jwksOption, value: 'jwks' },
+                            ]}
+                            value={effectiveJwtVerify}
+                            data-testid={selectors.components.Config.CustomSettingsConfig.jwtVerifySelect}
+                            onChange={(selected) => {
+                              let newSettings = customSettings.concat();
+                              newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaim, jwtClaimJoin, jwtVerify: selected.value as CHCustomSettingJWTVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
+                              setCustomSettings(newSettings);
+                              onCustomSettingsChange(newSettings);
+                            }}
+                            width={22}
+                          />
+                        </Field>
+                        {effectiveJwtVerify === 'jwks' && (
+                          <>
+                            <Field
+                              label={
+                                <Tooltip content={csLabels.jwtJwksUrlInput.tooltip}>
+                                  <span>{csLabels.jwtJwksUrlInput.label}</span>
+                                </Tooltip>
+                              }
+                              aria-label={csLabels.jwtJwksUrlInput.label}
+                            >
+                              <Input
+                                value={jwtJwksUrl || ''}
+                                placeholder={csLabels.jwtJwksUrlInput.placeholder}
+                                data-testid={selectors.components.Config.CustomSettingsConfig.jwtJwksUrlInput}
+                                onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
+                                  let newSettings = customSettings.concat();
+                                  newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaim, jwtClaimJoin, jwtVerify, jwtJwksUrl: changeEvent.target.value, jwtIssuer, jwtAudience };
+                                  setCustomSettings(newSettings);
+                                }}
+                                onBlur={() => { onCustomSettingsChange(customSettings); }}
+                              ></Input>
+                            </Field>
+                            <Field
+                              label={
+                                <Tooltip content={csLabels.jwtIssuerInput.tooltip}>
+                                  <span>{csLabels.jwtIssuerInput.label}</span>
+                                </Tooltip>
+                              }
+                              aria-label={csLabels.jwtIssuerInput.label}
+                            >
+                              <Input
+                                value={jwtIssuer || ''}
+                                placeholder={csLabels.jwtIssuerInput.placeholder}
+                                data-testid={selectors.components.Config.CustomSettingsConfig.jwtIssuerInput}
+                                onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
+                                  let newSettings = customSettings.concat();
+                                  newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaim, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer: changeEvent.target.value, jwtAudience };
+                                  setCustomSettings(newSettings);
+                                }}
+                                onBlur={() => { onCustomSettingsChange(customSettings); }}
+                              ></Input>
+                            </Field>
+                            <Field
+                              label={
+                                <Tooltip content={csLabels.jwtAudienceInput.tooltip}>
+                                  <span>{csLabels.jwtAudienceInput.label}</span>
+                                </Tooltip>
+                              }
+                              aria-label={csLabels.jwtAudienceInput.label}
+                            >
+                              <Input
+                                value={jwtAudience || ''}
+                                placeholder={csLabels.jwtAudienceInput.placeholder}
+                                data-testid={selectors.components.Config.CustomSettingsConfig.jwtAudienceInput}
+                                onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
+                                  let newSettings = customSettings.concat();
+                                  newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaim, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience: changeEvent.target.value };
+                                  setCustomSettings(newSettings);
+                                }}
+                                onBlur={() => { onCustomSettingsChange(customSettings); }}
+                              ></Input>
+                            </Field>
+                          </>
+                        )}
+                        <Field
+                          label={
+                            <Tooltip content={csLabels.onMissing.tooltip}>
+                              <span>{csLabels.onMissing.label}</span>
+                            </Tooltip>
+                          }
+                          aria-label={csLabels.onMissing.label}
+                        >
+                          <Select<CHCustomSettingOnMissing>
+                            options={[
+                              { label: csLabels.onMissing.rejectOption, value: 'reject' },
+                              { label: csLabels.onMissing.emptyOption, value: 'empty' },
+                            ]}
+                            value={(onMissing as CHCustomSettingOnMissing) || 'reject'}
+                            data-testid={selectors.components.Config.CustomSettingsConfig.onMissingSelect}
+                            onChange={(selected) => {
+                              let newSettings = customSettings.concat();
+                              newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing: selected.value as CHCustomSettingOnMissing, jwtHeaderName, jwtClaim, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
+                              setCustomSettings(newSettings);
+                              onCustomSettingsChange(newSettings);
+                            }}
+                            width={18}
+                          />
+                        </Field>
+                      </>
+                    )}
                   </Stack>
                 );
               })}
@@ -976,6 +1322,34 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
                 Add custom setting
               </Button>
             </ConfigSubSection>
+            <Field
+              label="Enforce read-only on all queries"
+              description={
+                anyEnforced
+                  ? 'Automatically enabled because at least one custom setting is marked Enforced.'
+                  : 'Forces readonly=1 on every query. Blocks INSERT/DDL from Grafana. Enable when you want read-only lockdown without enforced settings.'
+              }
+            >
+              <Tooltip
+                content={
+                  anyEnforced
+                    ? 'Disabled because enforceReadOnly is automatically on when any custom setting is marked Enforced.'
+                    : ''
+                }
+                placement="top"
+              >
+                <Switch
+                  value={anyEnforced || jsonData.enforceReadOnly || false}
+                  disabled={anyEnforced}
+                  onChange={(e) => {
+                    if (!anyEnforced) {
+                      onSwitchToggle('enforceReadOnly', e.currentTarget.checked);
+                    }
+                  }}
+                />
+              </Tooltip>
+            </Field>
+
           </ConfigSection>
         </>
       )}

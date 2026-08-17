@@ -90,6 +90,74 @@ export default {
           tooltip:
             'Show only column names in ad hoc filter keys instead of the full "table.column" format. This simplifies the filter interface when working with schemas that have many tables. Defaults to false.',
         },
+        customSettings: {
+          source: {
+            label: 'Source',
+            tooltip:
+              'Where the enforced value comes from at query time. "Static value" uses the literal value; "Request header" reads the value from a named HTTP header on each request; "JWT claim" reads a claim from a JWT token in a named header.',
+            staticOption: 'Static value',
+            headerOption: 'Request header',
+            jwtOption: 'JWT claim',
+          },
+          headerName: {
+            label: 'Header name',
+            placeholder: 'X-Allowed-Projects',
+            tooltip:
+              'Name of the HTTP header to read the setting value from. Must be forwarded by Grafana and set unconditionally by a trusted upstream proxy.',
+          },
+          onMissing: {
+            label: 'On missing',
+            tooltip:
+              'What to do when the dynamic source produces no value. "Reject query" (default) fails the query; "Treat as empty" sends an empty string.',
+            rejectOption: 'Reject query',
+            emptyOption: 'Treat as empty',
+          },
+          jwtTokenHeaderInput: {
+            label: 'Token header',
+            placeholder: 'X-Grafana-Id',
+            tooltip:
+              'Name of the HTTP header carrying the JWT. Defaults to "X-Grafana-Id" when left blank. The header must be forwarded by Grafana to backend plugins.',
+          },
+          jwtClaimPathInput: {
+            label: 'Claim path',
+            placeholder: 'tenants',
+            tooltip:
+              'Dot-separated path to the claim inside the JWT payload, e.g. "tenants" or "https://example.com/tenants".',
+          },
+          jwtArrayJoinInput: {
+            label: 'Array join',
+            placeholder: ',',
+            tooltip:
+              'Separator used to join array-valued claims into a single string before injecting the setting. Defaults to "," when left blank.',
+          },
+          jwtVerifySelect: {
+            label: 'Verify',
+            tooltip:
+              'Signature verification mode. "Trust forwarded token" accepts the token as-is; "Verify with JWKS" fetches the public keys from the JWKS URL and validates the signature, issuer, and audience.',
+            noneOption: 'Trust forwarded token',
+            jwksOption: 'Verify with JWKS',
+          },
+          jwtJwksUrlInput: {
+            label: 'JWKS URL',
+            placeholder: 'https://.../.well-known/jwks.json',
+            tooltip: 'HTTPS endpoint that returns the JSON Web Key Set used to verify the JWT signature.',
+          },
+          jwtIssuerInput: {
+            label: 'Expected issuer',
+            placeholder: 'https://issuer.example',
+            tooltip: 'Optional expected value of the "iss" claim. Verification fails if the token issuer does not match.',
+          },
+          jwtAudienceInput: {
+            label: 'Expected audience',
+            placeholder: '',
+            tooltip: 'Optional expected value of the "aud" claim. Verification fails if the token audience does not match.',
+          },
+          jwtInfoBanner: {
+            title: 'JWT-claim source',
+            message:
+              'By default, the forwarded token is trusted without signature verification. Enable JWKS verification when the token comes from an upstream IdP or when defence-in-depth against a compromised Grafana process is required. When using "X-Grafana-Id", Grafana must have ID-token forwarding enabled.',
+          },
+        },
       },
       HttpHeadersConfig: {
         title: 'HTTP Headers',

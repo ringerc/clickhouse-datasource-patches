@@ -299,6 +299,14 @@ export const AdditionalSettingsSection = (props: Props) => {
           </Field>
         )}
         <ConfigSubSection title="Custom Settings">
+          {/*
+           * NOTE: The v2 editor does not yet support the `enforced` field or the new
+           * `source`, `headerName`, `onMissing`, and JWT-source fields (`jwtClaim`,
+           * `jwtHeaderName`, `jwtClaimJoin`, `jwtVerify`, `jwtJwksUrl`, `jwtIssuer`,
+           * `jwtAudience`) introduced for header-sourced and JWT-sourced enforced
+           * settings. For the full enforcement UI (including header and JWT sources),
+           * see the v1 implementation in src/views/CHConfigEditor.tsx.
+           */}
           {customSettings.map(({ setting, value }, i) => {
             return (
               <Stack key={i} direction="row">

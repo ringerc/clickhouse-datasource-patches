@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -34,15 +35,110 @@ type grafanaHeadersKeyType struct{}
 
 var grafanaHeadersKey = grafanaHeadersKeyType{}
 
+// resolvedEnforcedCtxKeyType is the key type for the per-request resolved
+// clickhouse.Settings attached by MutateQueryData after binding resolution.
+type resolvedEnforcedCtxKeyType struct{}
+
+var resolvedEnforcedCtxKey = resolvedEnforcedCtxKeyType{}
+
+// resolvedEnforcedErrCtxKeyType is the key type for a binding-resolution error
+// smuggled from MutateQueryData to interpolateMacros so the query is rejected
+// before it reaches the database.
+type resolvedEnforcedErrCtxKeyType struct{}
+
+var resolvedEnforcedErrCtxKey = resolvedEnforcedErrCtxKeyType{}
+
 type grafanaHeaders struct {
 	DashboardUID string
 	PanelID      string
 	RuleUID      string
 }
 
+// enforcedSettingsCtxKeyType is the key type for storing the enforced
+// clickhouse.Settings in the context, used by tests to verify attachment.
+type enforcedSettingsCtxKeyType struct{}
+
+var enforcedSettingsCtxKey = enforcedSettingsCtxKeyType{}
+
 // Clickhouse defines how to connect to a Clickhouse datasource
 type Clickhouse struct {
-	SchemaDatasource *schemas.SchemaDatasource
+	SchemaDatasource   *schemas.SchemaDatasource
+	enforceReadOnly    bool
+	enforcedStatic     clickhouse.Settings // static entries + readonly=1; nil when empty
+	enforcedBindings   []EnforcedBinding   // all enforced entries (static + header + jwt); nil when empty
+	hasDynamicBindings bool                // true iff any binding is non-static; fast path guard
+	jwksCache          *jwksCache          // per-instance JWKS cache; non-nil when any jwt verify=jwks binding exists
+}
+
+// buildEnforcedStaticChSettings constructs the clickhouse.Settings map that must be
+// injected on every query when enforced settings or readonly=1 are configured.
+// Returns nil when neither applies. Never mutate the returned map.
+// Only static-source enforced settings are included; dynamic-source entries
+// (e.g. "header") are resolved per-query in commit 2.
+func buildEnforcedStaticChSettings(s Settings) clickhouse.Settings {
+	m := s.enforcedSettings()
+	if !s.shouldForceReadOnly() && len(m) == 0 {
+		return nil
+	}
+	cs := make(clickhouse.Settings, len(m)+1)
+	for k, v := range m {
+		cs[k] = v
+	}
+	if s.shouldForceReadOnly() {
+		cs["readonly"] = uint8(1)
+	}
+	return cs
+}
+
+// enforcedSettingsFromContext returns the enforced clickhouse.Settings stored
+// in ctx by MutateQuery. Returns nil when none were attached. Used by tests.
+func enforcedSettingsFromContext(ctx context.Context) clickhouse.Settings {
+	s, _ := ctx.Value(enforcedSettingsCtxKey).(clickhouse.Settings)
+	return s
+}
+
+// resolveEnforcedSettings materialises the clickhouse.Settings map for the
+// current request. Static bindings are copied from h.enforcedStatic; dynamic
+// bindings are resolved from ctx. Returns a downstream error when an
+// OnMissing="reject" binding cannot be satisfied.
+func (h *Clickhouse) resolveEnforcedSettings(ctx context.Context) (clickhouse.Settings, error) {
+	// Fast path: nothing dynamic to resolve.
+	if !h.hasDynamicBindings {
+		return h.enforcedStatic, nil
+	}
+	out := make(clickhouse.Settings, len(h.enforcedStatic)+len(h.enforcedBindings))
+	for k, v := range h.enforcedStatic {
+		out[k] = v
+	}
+	for _, b := range h.enforcedBindings {
+		if b.Source.Kind() == customSettingSourceStatic {
+			continue
+		}
+		val, ok, err := b.Source.Resolve(ctx)
+		if err != nil {
+			return nil, backend.DownstreamError(fmt.Errorf("enforced setting %q: %w", b.Setting, err))
+		}
+		if !ok {
+			if b.OnMissing == onMissingReject {
+				backend.Logger.Warn("query rejected: required header-sourced enforced setting absent",
+					"setting", b.Setting,
+					"source", b.Source.Kind(),
+				)
+				return nil, backend.DownstreamError(fmt.Errorf(
+					"query rejected: required value for enforced setting %q was not present on the request (source=%s)",
+					b.Setting, b.Source.Kind(),
+				))
+			}
+			val = ""
+		}
+		// Defence-in-depth: never let a dynamic binding overwrite readonly.
+		if strings.EqualFold(b.Setting, "readonly") {
+			continue
+		}
+		backend.Logger.Info("resolved enforced setting", "setting", b.Setting, "source", b.Source.Kind())
+		out[b.Setting] = wrapCustomSettingValue(b.Setting, val)
+	}
+	return out, nil
 }
 
 // getTLSConfig returns tlsConfig from settings
@@ -209,7 +305,9 @@ func buildClickHouseOptions(ctx context.Context, settings Settings, message json
 	customSettings := make(clickhouse.Settings)
 	if settings.CustomSettings != nil {
 		for _, setting := range settings.CustomSettings {
-			customSettings[setting.Setting] = setting.Value
+			if !setting.Enforced {
+				customSettings[setting.Setting] = setting.Value
+			}
 		}
 	}
 
@@ -372,8 +470,18 @@ func (h *Clickhouse) Macros() sqlds.Macros {
 	return sqlds.Macros{}
 }
 
-// MutateQueryError marks ClickHouse errors as downstream errors
+// MutateQueryError marks ClickHouse errors as downstream errors.
+// When EnforceReadOnly is active, READONLY errors (code 164) are rewritten
+// with a friendlier message explaining that readonly=1 is enforced.
 func (h *Clickhouse) MutateQueryError(err error) backend.ErrorWithSource {
+	var ex *clickhouse.Exception
+	if errors.As(err, &ex) && ex.Code == 164 && h.enforceReadOnly {
+		friendly := fmt.Sprintf(
+			"query rejected: this datasource enforces server-side ClickHouse settings and runs queries under readonly=1; "+
+				"SET/SETTINGS clauses that change server settings are not allowed. Original error: %s", err)
+		combined := errors.Join(errors.New(friendly), err)
+		return backend.NewErrorWithSource(combined, backend.ErrorSourceDownstream)
+	}
 	// Check if any error in the error chain (including multi-errors) is a clickhouse.Exception
 	if containsClickHouseException(err) {
 		return backend.NewErrorWithSource(err, backend.ErrorSourceDownstream)
@@ -446,16 +554,18 @@ func (h *Clickhouse) Settings(ctx context.Context, config backend.DataSourceInst
 }
 
 // MutateQueryData extracts Grafana contextual headers from the request and
-// stores them in the context for ClickHouse query metadata injection.
+// stores them in the context for ClickHouse query metadata injection. It also
+// extracts forwarded HTTP headers, resolves enforced-settings bindings once per
+// request, and stores the result (or error) in ctx for MutateQuery / interpolateMacros.
 func (h *Clickhouse) MutateQueryData(
 	ctx context.Context,
 	req *backend.QueryDataRequest,
 ) (context.Context, *backend.QueryDataRequest) {
-	headers := req.GetHTTPHeaders()
+	httpHeaders := req.GetHTTPHeaders()
 	gh := grafanaHeaders{
-		DashboardUID: headers.Get("X-Dashboard-Uid"),
-		PanelID:      headers.Get("X-Panel-Id"),
-		RuleUID:      headers.Get("X-Rule-Uid"),
+		DashboardUID: httpHeaders.Get("X-Dashboard-Uid"),
+		PanelID:      httpHeaders.Get("X-Panel-Id"),
+		RuleUID:      httpHeaders.Get("X-Rule-Uid"),
 	}
 	if gh.DashboardUID != "" || gh.PanelID != "" || gh.RuleUID != "" {
 		ctx = context.WithValue(ctx, grafanaHeadersKey, gh)
@@ -463,8 +573,50 @@ func (h *Clickhouse) MutateQueryData(
 
 	injectGrafanaUserHeader(ctx, req)
 
+	// Build the canonicalised forwarded-headers map from two sources:
+	//   1. The query JSON body (sqlds's grafana-http-headers key) — used when
+	//      ForwardHeaders is on and sqlds serialises them into ConnectionArgs.
+	//   2. The HTTP-level req.GetHTTPHeaders() map — fallback for plain header
+	//      forwarding or single-header test setups.
+	fwdRaw, _ := extractForwardedHeadersFromMessage(firstQueryMessage(req))
+	canon := make(map[string]string, len(fwdRaw)+len(httpHeaders))
+	for k, v := range fwdRaw {
+		canon[http.CanonicalHeaderKey(k)] = v
+	}
+	for k, vv := range httpHeaders {
+		ck := http.CanonicalHeaderKey(k)
+		if _, exists := canon[ck]; !exists {
+			canon[ck] = strings.Join(vv, ",")
+		}
+	}
+	ctx = WithForwardedHeaders(ctx, canon)
+
+	if len(h.enforcedBindings) > 0 {
+		resolved, resolveErr := h.resolveEnforcedSettings(ctx)
+		if resolveErr != nil {
+			ctx = context.WithValue(ctx, resolvedEnforcedErrCtxKey, resolveErr)
+		} else {
+			ctx = context.WithValue(ctx, resolvedEnforcedCtxKey, resolved)
+		}
+	}
+
 	req = preprocessGrafanaSQL(req)
 	return ctx, req
+}
+
+// firstQueryMessage returns the JSON of the first query in req that has
+// non-empty JSON. This is what sqlds forwards to Connect as the connection
+// message and where forwarded HTTP headers are embedded.
+func firstQueryMessage(req *backend.QueryDataRequest) json.RawMessage {
+	if req == nil {
+		return nil
+	}
+	for _, q := range req.Queries {
+		if len(q.JSON) > 0 {
+			return q.JSON
+		}
+	}
+	return nil
 }
 
 // injectGrafanaUserHeader populates X-Grafana-User from the request's user
@@ -506,7 +658,14 @@ func injectGrafanaUserHeader(ctx context.Context, req *backend.QueryDataRequest)
 // handlers ($__table, $__column) return plain errors, and sqlds only
 // downstream-classifies bad-argument-count and bracket errors on its own —
 // so without this wrap those would be miscounted as plugin errors.
-func interpolateMacros(_ context.Context, query *sqlutil.Query, _ json.RawMessage) (string, error) {
+//
+// Before interpolating, the function checks for a binding-resolution error
+// stored in ctx by MutateQueryData; if present the query is immediately
+// rejected without touching the database.
+func interpolateMacros(ctx context.Context, query *sqlutil.Query, _ json.RawMessage) (string, error) {
+	if err, ok := ctx.Value(resolvedEnforcedErrCtxKey).(error); ok {
+		return "", err // already wrapped in backend.DownstreamError by resolveEnforcedSettings
+	}
 	sql, err := macros.Interpolate(query.RawSQL, query)
 	if err != nil {
 		return "", backend.DownstreamError(err)
@@ -570,7 +729,58 @@ func (h *Clickhouse) MutateQuery(ctx context.Context, req backend.DataQuery) (co
 
 	defer span.End()
 
-	comments := make([]string, 0, 4)
+	// Prefer the per-request resolved settings (attached in MutateQueryData).
+	// Falls back to h.enforcedStatic when MutateQueryData did not run — unit
+	// tests instantiate Clickhouse directly without going through the sqlds
+	// query-data pipeline.
+	var resolved clickhouse.Settings
+	if v, ok := ctx.Value(resolvedEnforcedCtxKey).(clickhouse.Settings); ok {
+		resolved = v
+	} else if _, hasErr := ctx.Value(resolvedEnforcedErrCtxKey).(error); !hasErr && !h.hasDynamicBindings {
+		resolved = h.enforcedStatic
+	}
+
+	if len(resolved) > 0 {
+		ctx = clickhouse.Context(ctx, clickhouse.WithSettings(resolved))
+		ctx = context.WithValue(ctx, enforcedSettingsCtxKey, resolved)
+
+		// Record the number of user-configured enforced settings (not counting
+		// readonly=1 itself) and whether read-only enforcement is active.
+		// Values are intentionally omitted — they can encode tenant identity.
+		userSettingCount := len(resolved)
+		if h.enforceReadOnly {
+			userSettingCount--
+		}
+		headerCount := 0
+		headerResolved := 0
+		jwtCount := 0
+		jwtResolved := 0
+		for _, b := range h.enforcedBindings {
+			switch b.Source.Kind() {
+			case customSettingSourceHeader:
+				headerCount++
+				if _, ok := resolved[b.Setting]; ok {
+					headerResolved++
+				}
+			case CustomSettingSourceJWT:
+				jwtCount++
+				if _, ok := resolved[b.Setting]; ok {
+					jwtResolved++
+				}
+			}
+		}
+		span.SetAttributes(
+			attribute.Int("clickhouse.enforced_settings.count", userSettingCount),
+			attribute.Bool("clickhouse.enforced_readonly", h.enforceReadOnly),
+			attribute.Int("clickhouse.enforced_settings.header_sourced.count", headerCount),
+			attribute.Int("clickhouse.enforced_settings.header_sourced.resolved", headerResolved),
+			attribute.Int("clickhouse.enforced_settings.jwt_sourced.count", jwtCount),
+			attribute.Int("clickhouse.enforced_settings.jwt_sourced.resolved", jwtResolved),
+			attribute.Int("clickhouse.enforced_settings.jwt_sourced.verify_failures", 0),
+		)
+	}
+
+	comments := make([]string, 0, 4+len(h.enforcedBindings))
 
 	if user := backend.UserFromContext(ctx); user != nil {
 		comments = append(comments, "grafana_user:"+user.Login)
@@ -585,6 +795,26 @@ func (h *Clickhouse) MutateQuery(ctx context.Context, req backend.DataQuery) (co
 		}
 		if gh.RuleUID != "" {
 			comments = append(comments, "grafana_rule:"+gh.RuleUID)
+		}
+	}
+
+	// Tag each dynamically-sourced enforced setting whose value was resolved for
+	// this request so operators can correlate query comments to binding config.
+	// Setting names only — never values.
+	for _, b := range h.enforcedBindings {
+		switch b.Source.Kind() {
+		case customSettingSourceHeader:
+			if resolved != nil {
+				if _, ok := resolved[b.Setting]; ok {
+					comments = append(comments, "enforced_from_header:"+b.Setting)
+				}
+			}
+		case CustomSettingSourceJWT:
+			if resolved != nil {
+				if _, ok := resolved[b.Setting]; ok {
+					comments = append(comments, "enforced_from_jwt:"+b.Setting)
+				}
+			}
 		}
 	}
 

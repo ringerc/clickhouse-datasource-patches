@@ -53,6 +53,8 @@ export interface CHConfig extends DataSourceJsonData {
   customSettings?: CHCustomSetting[];
   enableSecureSocksProxy?: boolean;
   enableRowLimit?: boolean;
+  /** Forces readonly=1 on every query, blocking INSERT/DDL. Auto-enabled when any customSetting has enforced=true. */
+  enforceReadOnly?: boolean;
 
   /**
    * Optional expected row count passed to sqlds as DriverSettings.RowCapacityHint.
@@ -107,7 +109,41 @@ export interface CHHttpHeader {
 export interface CHCustomSetting {
   setting: string;
   value: string;
+  /** When true, the setting is sent alongside readonly=1 on every query so the user's SQL cannot override it. */
+  enforced?: boolean;
+  /**
+   * Where the effective value comes from at query time.
+   *  - undefined / "static": use `value` verbatim (default; the only mode for non-enforced rows).
+   *  - "header": read from the named HTTP header on each request; `headerName` is required and `value` must be empty.
+   *  - "jwt": read a claim from a JWT in the named HTTP header on each request; `jwtClaim` is required and `value` must be empty.
+   * Only meaningful when `enforced === true`.
+   */
+  source?: CHCustomSettingSource;
+  /** Required when `source === "header"`. Canonicalised server-side. */
+  headerName?: string;
+  /** Behaviour when a dynamic source produces no value. Defaults to "reject". */
+  onMissing?: CHCustomSettingOnMissing;
+
+  // JWT-source fields — only meaningful when source === "jwt".
+  /** HTTP header carrying the JWT. Defaults to "X-Grafana-Id". Canonicalised server-side. */
+  jwtHeaderName?: string;
+  /** Dotted claim path, e.g. "tenants" or "a.b.c". Required when source === "jwt". */
+  jwtClaim?: string;
+  /** Separator used to join array claims into a single string. Defaults to ",". */
+  jwtClaimJoin?: string;
+  /** Signature verification mode. Defaults to "none" (trust forwarded token). */
+  jwtVerify?: CHCustomSettingJWTVerify;
+  /** JWKS endpoint URL (https only). Required when jwtVerify === "jwks". */
+  jwtJwksUrl?: string;
+  /** Optional expected issuer (iss claim). Only checked when jwtVerify === "jwks". */
+  jwtIssuer?: string;
+  /** Optional expected audience (aud claim). Only checked when jwtVerify === "jwks". */
+  jwtAudience?: string;
 }
+
+export type CHCustomSettingSource = 'static' | 'header' | 'jwt';
+export type CHCustomSettingOnMissing = 'reject' | 'empty';
+export type CHCustomSettingJWTVerify = 'none' | 'jwks';
 
 export interface CHLogsConfig {
   defaultDatabase?: string;

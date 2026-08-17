@@ -7,6 +7,7 @@ import { mockConfigEditorProps } from '__mocks__/ConfigEditor';
 import '@testing-library/jest-dom';
 import { CHConfig, Protocol } from 'types/config';
 import allLabels from 'labels';
+import { selectors } from '../selectors';
 
 jest.mock('@grafana/runtime', () => {
   const original = jest.requireActual('@grafana/runtime');
@@ -300,4 +301,229 @@ describe('ConfigEditor', () => {
       })
     );
   });
+
+  describe('Enforced custom settings — header source', () => {
+    const csSelectors = selectors.components.Config.CustomSettingsConfig;
+    const csLabels = allLabels.components.Config.ConfigEditor.customSettings;
+
+    it('renders header-sourced row with headerName and onMissing controls', () => {
+      render(
+        <ConfigEditor
+          {...mockConfigEditorProps({
+            customSettings: [
+              { setting: 'custom_visible_tenants', value: '', enforced: true, source: 'header', headerName: 'X-Foo', onMissing: 'reject' },
+            ],
+          })}
+        />
+      );
+      expect(screen.getByTestId(csSelectors.headerNameInput)).toHaveValue('X-Foo');
+      const onMissingSelect = screen.getByTestId(csSelectors.onMissingSelect);
+      expect(onMissingSelect).toBeInTheDocument();
+      expect(screen.getByText(csLabels.onMissing.rejectOption)).toBeInTheDocument();
+    });
+
+    it('switching Source to header clears value and hides Value input', () => {
+      // Render a row already in header-source mode to verify the value field
+      // is replaced with the disabled placeholder (testing the conditional render
+      // that fires when source==='header').
+      render(
+        <ConfigEditor
+          {...mockConfigEditorProps({
+            customSettings: [
+              { setting: 'custom_visible_tenants', value: '', enforced: true, source: 'header', headerName: 'X-Hdr' },
+            ],
+          })}
+        />
+      );
+      // The disabled placeholder input should be visible instead of the editable value input
+      expect(screen.getByPlaceholderText('(from header)')).toBeInTheDocument();
+      // The editable 'Value' input should not be present for this row
+      expect(screen.queryByPlaceholderText('Value')).not.toBeInTheDocument();
+    });
+
+    it('switching Source from header to static clears headerName and onMissing', () => {
+      // Verify that a static-source enforced row does NOT render the header-specific controls,
+      // which confirms they are cleared/hidden when source is static.
+      render(
+        <ConfigEditor
+          {...mockConfigEditorProps({
+            customSettings: [
+              { setting: 'custom_visible_tenants', value: 'v', enforced: true, source: 'static' },
+            ],
+          })}
+        />
+      );
+      expect(screen.queryByTestId(csSelectors.headerNameInput)).not.toBeInTheDocument();
+      expect(screen.queryByTestId(csSelectors.onMissingSelect)).not.toBeInTheDocument();
+      // The normal Value input must be present for static source
+      expect(screen.getByDisplayValue('v')).toBeInTheDocument();
+    });
+
+    it('shows the header warning banner when any row has source=header, absent otherwise', () => {
+      // Banner present when source=header
+      const { unmount } = render(
+        <ConfigEditor
+          {...mockConfigEditorProps({
+            customSettings: [
+              { setting: 'custom_x', value: '', enforced: true, source: 'header', headerName: 'X-Hdr' },
+            ],
+          })}
+        />
+      );
+      expect(screen.getByTestId(csSelectors.headerWarningBanner)).toBeInTheDocument();
+      unmount();
+
+      // Banner absent when source=static (no header rows)
+      render(
+        <ConfigEditor
+          {...mockConfigEditorProps({
+            customSettings: [
+              { setting: 'custom_x', value: 'v', enforced: true, source: 'static' },
+            ],
+          })}
+        />
+      );
+      expect(screen.queryByTestId(csSelectors.headerWarningBanner)).not.toBeInTheDocument();
+    });
+
+    it('header-sourced rows survive the persistence filter when headerName is set', () => {
+      const props = mockConfigEditorProps({
+        customSettings: [
+          { setting: 'custom_x', value: '', enforced: true, source: 'header', headerName: 'X-Hdr' },
+        ],
+      });
+      render(<ConfigEditor {...props} />);
+
+      // Trigger onBlur on the header name input to fire onCustomSettingsChange
+      const headerNameInput = screen.getByTestId(csSelectors.headerNameInput);
+      fireEvent.blur(headerNameInput);
+
+      expect(props.onOptionsChange).toHaveBeenCalledWith(
+        expect.objectContaining({
+          jsonData: expect.objectContaining({
+            customSettings: expect.arrayContaining([
+              expect.objectContaining({ setting: 'custom_x', source: 'header', headerName: 'X-Hdr' }),
+            ]),
+          }),
+        })
+      );
+    });
+  });
+
+  describe('Enforced custom settings — JWT source', () => {
+    const csSelectors = selectors.components.Config.CustomSettingsConfig;
+
+    it('renders JWT-sourced row (verify=none): token header, claim path, verify select, info banner; hides Value and JWKS inputs', () => {
+      render(
+        <ConfigEditor
+          {...mockConfigEditorProps({
+            customSettings: [
+              {
+                setting: 'custom_visible_tenants',
+                value: '',
+                enforced: true,
+                source: 'jwt',
+                jwtHeaderName: 'X-Grafana-Id',
+                jwtClaim: 'tenants',
+                jwtVerify: 'none',
+              },
+            ],
+          })}
+        />
+      );
+      // Value input hidden — replaced by disabled placeholder
+      expect(screen.getByPlaceholderText('(from JWT claim)')).toBeInTheDocument();
+      expect(screen.queryByPlaceholderText('Value')).not.toBeInTheDocument();
+      // Token header input present with value
+      expect(screen.getByTestId(csSelectors.jwtTokenHeaderInput)).toHaveValue('X-Grafana-Id');
+      // Claim path input present with value
+      expect(screen.getByTestId(csSelectors.jwtClaimPathInput)).toHaveValue('tenants');
+      // Verify select rendered
+      expect(screen.getByTestId(csSelectors.jwtVerifySelect)).toBeInTheDocument();
+      // JWKS URL input NOT present (verify=none)
+      expect(screen.queryByTestId(csSelectors.jwtJwksUrlInput)).not.toBeInTheDocument();
+      // Info banner present
+      expect(screen.getByTestId(csSelectors.jwtInfoBanner)).toBeInTheDocument();
+    });
+
+    it('renders JWT-sourced row (verify=jwks): JWKS URL, issuer, audience inputs rendered with values', () => {
+      render(
+        <ConfigEditor
+          {...mockConfigEditorProps({
+            customSettings: [
+              {
+                setting: 'custom_visible_tenants',
+                value: '',
+                enforced: true,
+                source: 'jwt',
+                jwtHeaderName: 'X-Grafana-Id',
+                jwtClaim: 'tenants',
+                jwtVerify: 'jwks',
+                jwtJwksUrl: 'https://issuer.example/.well-known/jwks.json',
+                jwtIssuer: 'https://issuer.example',
+                jwtAudience: 'grafana',
+              },
+            ],
+          })}
+        />
+      );
+      expect(screen.getByTestId(csSelectors.jwtJwksUrlInput)).toHaveValue('https://issuer.example/.well-known/jwks.json');
+      expect(screen.getByTestId(csSelectors.jwtIssuerInput)).toHaveValue('https://issuer.example');
+      expect(screen.getByTestId(csSelectors.jwtAudienceInput)).toHaveValue('grafana');
+    });
+
+    it('does not render any JWT fields for a static-source row', () => {
+      render(
+        <ConfigEditor
+          {...mockConfigEditorProps({
+            customSettings: [
+              { setting: 'custom_x', value: 'v', enforced: true, source: 'static' },
+            ],
+          })}
+        />
+      );
+      expect(screen.queryByTestId(csSelectors.jwtTokenHeaderInput)).not.toBeInTheDocument();
+      expect(screen.queryByTestId(csSelectors.jwtClaimPathInput)).not.toBeInTheDocument();
+      expect(screen.queryByTestId(csSelectors.jwtVerifySelect)).not.toBeInTheDocument();
+      expect(screen.queryByTestId(csSelectors.jwtInfoBanner)).not.toBeInTheDocument();
+    });
+
+    it('JWT row with jwtClaim survives persistence filter on blur', () => {
+      const props = mockConfigEditorProps({
+        customSettings: [
+          { setting: 'custom_x', value: '', enforced: true, source: 'jwt', jwtClaim: 'tenants' },
+        ],
+      });
+      render(<ConfigEditor {...props} />);
+
+      const claimPathInput = screen.getByTestId(csSelectors.jwtClaimPathInput);
+      fireEvent.blur(claimPathInput);
+
+      expect(props.onOptionsChange).toHaveBeenCalledWith(
+        expect.objectContaining({
+          jsonData: expect.objectContaining({
+            customSettings: expect.arrayContaining([
+              expect.objectContaining({ setting: 'custom_x', source: 'jwt', jwtClaim: 'tenants' }),
+            ]),
+          }),
+        })
+      );
+    });
+
+    it('JWT row without jwtClaim is dropped by persistence filter', () => {
+      const props = mockConfigEditorProps({
+        customSettings: [
+          { setting: 'custom_x', value: '', enforced: true, source: 'jwt' },
+        ],
+      });
+      render(<ConfigEditor {...props} />);
+
+      const claimPathInput = screen.getByTestId(csSelectors.jwtClaimPathInput);
+      fireEvent.blur(claimPathInput);
+
+      const call = (props.onOptionsChange as jest.Mock).mock.calls.slice(-1)[0][0];
+      expect(call.jsonData.customSettings).toHaveLength(0);
+    });
+  });
 });
+

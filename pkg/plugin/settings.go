@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -67,6 +69,14 @@ type Settings struct {
 	// memory.
 	RowCapacityHint int64 `json:"rowCapacityHint,omitempty"`
 
+	// EnforceReadOnly forces readonly=1 on every query executed via this datasource,
+	// making it read-only (INSERT/DDL from Grafana will be blocked). It is
+	// automatically set to true when any CustomSetting has Enforced=true. Server
+	// tunables that operators want users to still adjust per query (e.g. max_threads)
+	// should be marked <changeable_in_readonly/> server-side; the enforced tenant
+	// settings must NOT be marked that way.
+	EnforceReadOnly bool `json:"enforceReadOnly,omitempty"`
+
 	// EnableSchemaCache gates the in-process cache that memoizes
 	// system.tables / system.columns / DISTINCT column-value lookups used
 	// by the query builder. Defaults to true.
@@ -78,9 +88,49 @@ type Settings struct {
 }
 
 type CustomSetting struct {
-	Setting string `json:"setting"`
-	Value   string `json:"value"`
+	Setting  string `json:"setting"`
+	Value    string `json:"value"`
+	Enforced bool   `json:"enforced,omitempty"`
+
+	// Source selects how the enforced value is resolved per-query.
+	// "" or "static" (default) → use Value verbatim.
+	// "header" → read from the named HTTP header per request.
+	// "jwt" → read a claim from a JWT in the named HTTP header per request.
+	// Only meaningful when Enforced == true.
+	Source     string `json:"source,omitempty"`
+	HeaderName string `json:"headerName,omitempty"`
+	// OnMissing controls behavior when a dynamic source produces no value.
+	// "reject" (default) → fail the query with a downstream error.
+	// "empty"  → send the empty string.
+	OnMissing string `json:"onMissing,omitempty"`
+
+	// JWT-source fields — only meaningful when Source == "jwt".
+	JWTHeaderName string `json:"jwtHeaderName,omitempty"` // default "X-Grafana-Id"
+	JWTClaim      string `json:"jwtClaim,omitempty"`      // dotted path, e.g. "tenants" or "a.b.c"
+	JWTClaimJoin  string `json:"jwtClaimJoin,omitempty"`  // separator for array claims; default ","
+	JWTVerify     string `json:"jwtVerify,omitempty"`     // "none" (default) | "jwks"
+	JWTJWKSURL    string `json:"jwtJwksUrl,omitempty"`    // required iff JWTVerify == "jwks"
+	JWTIssuer     string `json:"jwtIssuer,omitempty"`     // optional iss check (jwks only)
+	JWTAudience   string `json:"jwtAudience,omitempty"`   // optional aud check (jwks only)
 }
+
+const (
+	customSettingSourceStatic = "static"
+	customSettingSourceHeader = "header"
+	// CustomSettingSourceJWT is the source identifier for JWT-claim-based enforced settings.
+	CustomSettingSourceJWT = "jwt"
+
+	onMissingReject = "reject"
+	onMissingEmpty  = "empty"
+
+	// CustomSettingJWTVerifyNone skips signature verification (trust forwarded token).
+	CustomSettingJWTVerifyNone = "none"
+	// CustomSettingJWTVerifyJWKS verifies the token signature against a JWKS endpoint.
+	CustomSettingJWTVerifyJWKS = "jwks"
+
+	defaultJWTHeaderName = "X-Grafana-Id"
+	defaultJWTClaimJoin  = ","
+)
 
 const secureHeaderKeyPrefix = "secureHttpHeaders."
 
@@ -92,6 +142,84 @@ func (settings *Settings) isValid() (err error) {
 		return backend.DownstreamError(ErrorMessageInvalidPort)
 	}
 	return nil
+}
+
+// enforcedSettings returns a clickhouse.Settings map containing only the
+// CustomSettings entries marked Enforced that use the static source (Source == ""
+// or Source == "static"). Dynamic-source entries (e.g. "header") are excluded
+// because their values are not known at instance-creation time.
+// Returns nil if no static-enforced entries exist.
+//
+// Values for setting names beginning with "custom_" are wrapped in
+// clickhouse.CustomSetting{Value}. That wrapper is required by clickhouse-go's
+// Native protocol to send user-defined (custom_*) settings; without it the
+// server rejects them with code 115 "Unknown setting". HTTP tolerates plain
+// strings via URL params, but the wrapper is also accepted there, so we always
+// wrap for consistency across protocols.
+func (s Settings) enforcedSettings() clickhouse.Settings {
+	var m clickhouse.Settings
+	for _, cs := range s.CustomSettings {
+		if cs.Enforced && (cs.Source == "" || cs.Source == customSettingSourceStatic) {
+			if m == nil {
+				m = make(clickhouse.Settings)
+			}
+			m[cs.Setting] = wrapCustomSettingValue(cs.Setting, cs.Value)
+		}
+	}
+	return m
+}
+
+// enforcedBindings returns the list of EnforcedBinding values for all
+// CustomSettings entries that are marked Enforced. It uses a zero-value
+// EnforcedSourceRuntime (no JWKS cache), which is sufficient for the
+// validation and health-check call sites that never call Resolve().
+func (s Settings) enforcedBindings() ([]EnforcedBinding, error) {
+	return s.enforcedBindingsWithRuntime(EnforcedSourceRuntime{})
+}
+
+// enforcedBindingsWithRuntime is like enforcedBindings but passes rt to each
+// factory, enabling JWT sources to obtain a live JWKS cache from the runtime.
+// Called by NewDatasource after the JWKS cache has been created.
+func (s Settings) enforcedBindingsWithRuntime(rt EnforcedSourceRuntime) ([]EnforcedBinding, error) {
+	var bindings []EnforcedBinding
+	for _, cs := range s.CustomSettings {
+		if !cs.Enforced {
+			continue
+		}
+		b, err := BuildEnforcedBinding(cs, rt)
+		if err != nil {
+			return nil, fmt.Errorf("invalid enforced custom setting %q: %w", cs.Setting, err)
+		}
+		bindings = append(bindings, b)
+	}
+	return bindings, nil
+}
+
+// wrapCustomSettingValue wraps values for custom_-prefixed settings in
+// clickhouse.CustomSetting so clickhouse-go's Native protocol serializer
+// tags them as user-defined rather than as built-in server settings.
+func wrapCustomSettingValue(name, value string) interface{} {
+	if strings.HasPrefix(name, "custom_") {
+		return clickhouse.CustomSetting{Value: value}
+	}
+	return value
+}
+
+// shouldForceReadOnly reports whether readonly=1 must be injected on every
+// query. Returns true when EnforceReadOnly is set or when any CustomSetting
+// has Enforced=true (regardless of source). The direct Enforced check is used
+// rather than enforcedSettings() so that dynamic-source entries (e.g. "header")
+// also trigger readonly enforcement.
+func (s Settings) shouldForceReadOnly() bool {
+	if s.EnforceReadOnly {
+		return true
+	}
+	for _, cs := range s.CustomSettings {
+		if cs.Enforced {
+			return true
+		}
+	}
+	return false
 }
 
 // LoadSettings will read and validate Settings from the DataSourceConfig
@@ -208,10 +336,55 @@ func LoadSettings(ctx context.Context, config backend.DataSourceInstanceSettings
 
 		for i, raw := range customSettingsRaw {
 			rawMap := raw.(map[string]interface{})
-			customSettings[i] = CustomSetting{
+			cs := CustomSetting{
 				Setting: rawMap["setting"].(string),
-				Value:   rawMap["value"].(string),
 			}
+			if v, ok := rawMap["value"].(string); ok {
+				cs.Value = v
+			}
+			if rawMap["enforced"] != nil {
+				switch v := rawMap["enforced"].(type) {
+				case bool:
+					cs.Enforced = v
+				case string:
+					if parsed, parseErr := strconv.ParseBool(v); parseErr == nil {
+						cs.Enforced = parsed
+					} else {
+						backend.Logger.Warn("Failed to parse enforced value for custom setting, defaulting to false", "setting", cs.Setting, "error", parseErr)
+					}
+				}
+			}
+			if v, ok := rawMap["source"].(string); ok {
+				cs.Source = v
+			}
+			if v, ok := rawMap["headerName"].(string); ok {
+				cs.HeaderName = v
+			}
+			if v, ok := rawMap["onMissing"].(string); ok {
+				cs.OnMissing = v
+			}
+			if v, ok := rawMap["jwtHeaderName"].(string); ok {
+				cs.JWTHeaderName = v
+			}
+			if v, ok := rawMap["jwtClaim"].(string); ok {
+				cs.JWTClaim = v
+			}
+			if v, ok := rawMap["jwtClaimJoin"].(string); ok {
+				cs.JWTClaimJoin = v
+			}
+			if v, ok := rawMap["jwtVerify"].(string); ok {
+				cs.JWTVerify = v
+			}
+			if v, ok := rawMap["jwtJwksUrl"].(string); ok {
+				cs.JWTJWKSURL = v
+			}
+			if v, ok := rawMap["jwtIssuer"].(string); ok {
+				cs.JWTIssuer = v
+			}
+			if v, ok := rawMap["jwtAudience"].(string); ok {
+				cs.JWTAudience = v
+			}
+			customSettings[i] = cs
 		}
 
 		settings.CustomSettings = customSettings
@@ -257,6 +430,65 @@ func LoadSettings(ctx context.Context, config backend.DataSourceInstanceSettings
 			}
 		} else {
 			settings.EnableRowLimit = jsonData["enableRowLimit"].(bool)
+		}
+	}
+
+	if raw, ok := jsonData["enforceReadOnly"]; ok && raw != nil {
+		switch v := raw.(type) {
+		case bool:
+			settings.EnforceReadOnly = v
+		case string:
+			if parsed, parseErr := strconv.ParseBool(v); parseErr == nil {
+				settings.EnforceReadOnly = parsed
+			} else {
+				backend.Logger.Warn("Failed to parse enforceReadOnly value, defaulting to false", "error", parseErr)
+			}
+		}
+	}
+
+	// If any custom setting is marked enforced, force EnforceReadOnly on.
+	if !settings.EnforceReadOnly {
+		for _, cs := range settings.CustomSettings {
+			if cs.Enforced {
+				settings.EnforceReadOnly = true
+				backend.Logger.Info("enforceReadOnly implicitly enabled because at least one custom setting is marked enforced")
+				break
+			}
+		}
+	}
+
+	// Validate and normalise JWT-sourced settings before the factory lookup so
+	// operator errors surface with helpful messages independent of whether a JWT
+	// source factory is registered (e.g. in early development commits before the
+	// factory is wired up).
+	for i := range settings.CustomSettings {
+		cs := &settings.CustomSettings[i]
+		if cs.Source != CustomSettingSourceJWT {
+			continue
+		}
+		if err := validateAndNormalizeJWTCustomSetting(cs); err != nil {
+			return settings, backend.DownstreamError(err)
+		}
+	}
+
+	// Validate enforced bindings at load time so misconfigured dynamic sources
+	// are caught before any query is executed.
+	if _, err := settings.enforcedBindings(); err != nil {
+		return settings, backend.DownstreamError(err)
+	}
+	// Additionally validate non-enforced entries that specify a dynamic source:
+	// dynamic sources (e.g. "header") require Enforced=true, so a non-enforced
+	// entry with a dynamic source is always a misconfiguration.
+	for _, cs := range settings.CustomSettings {
+		if cs.Enforced {
+			continue
+		}
+		src := cs.Source
+		if src == "" || src == customSettingSourceStatic {
+			continue
+		}
+		if _, err := BuildEnforcedBinding(cs, EnforcedSourceRuntime{}); err != nil {
+			return settings, backend.DownstreamError(fmt.Errorf("invalid custom setting %q: %w", cs.Setting, err))
 		}
 	}
 
@@ -371,6 +603,109 @@ func LoadSettings(ctx context.Context, config backend.DataSourceInstanceSettings
 	}
 
 	return settings, settings.isValid()
+}
+
+// validateAndNormalizeJWTCustomSetting validates and normalises JWT-source fields
+// on a CustomSetting in-place. It is called by LoadSettings for every entry with
+// Source == "jwt" before the factory registry lookup, so that operator
+// misconfiguration produces a helpful error message regardless of whether a JWT
+// factory is registered in the source registry.
+func validateAndNormalizeJWTCustomSetting(cs *CustomSetting) error {
+	if !cs.Enforced {
+		return fmt.Errorf("source=jwt requires enforced=true for setting %q", cs.Setting)
+	}
+	if cs.Value != "" {
+		return fmt.Errorf("source=jwt must not set value for setting %q; the value is resolved from the JWT claim at request time", cs.Setting)
+	}
+	if strings.EqualFold(cs.Setting, "readonly") {
+		return fmt.Errorf("source=jwt must not bind to reserved setting %q", cs.Setting)
+	}
+
+	// jwtClaim is required and must be a valid dotted path.
+	if cs.JWTClaim == "" {
+		return fmt.Errorf("source=jwt requires non-empty jwtClaim for setting %q", cs.Setting)
+	}
+	if err := validateJWTClaimPath(cs.JWTClaim); err != nil {
+		return fmt.Errorf("invalid jwtClaim for setting %q: %w", cs.Setting, err)
+	}
+
+	// Normalise jwtHeaderName: empty → default, then canonicalise via http.CanonicalHeaderKey.
+	if cs.JWTHeaderName == "" {
+		cs.JWTHeaderName = defaultJWTHeaderName
+	}
+	cs.JWTHeaderName = http.CanonicalHeaderKey(cs.JWTHeaderName)
+
+	// Normalise jwtClaimJoin.
+	if cs.JWTClaimJoin == "" {
+		cs.JWTClaimJoin = defaultJWTClaimJoin
+	}
+
+	// Normalise jwtVerify: empty → "none". Unknown value → reject.
+	if cs.JWTVerify == "" {
+		cs.JWTVerify = CustomSettingJWTVerifyNone
+	}
+	cs.JWTVerify = strings.ToLower(cs.JWTVerify)
+
+	switch cs.JWTVerify {
+	case CustomSettingJWTVerifyNone:
+		// verify=none: JWKS URL, issuer, and audience are not applicable and must not be set.
+		if cs.JWTJWKSURL != "" {
+			return fmt.Errorf("jwtJwksUrl is set but jwtVerify=%q for setting %q; jwtJwksUrl is only valid when jwtVerify=%q",
+				CustomSettingJWTVerifyNone, cs.Setting, CustomSettingJWTVerifyJWKS)
+		}
+		if cs.JWTIssuer != "" {
+			return fmt.Errorf("jwtIssuer is set but jwtVerify=%q for setting %q; jwtIssuer is only valid when jwtVerify=%q",
+				CustomSettingJWTVerifyNone, cs.Setting, CustomSettingJWTVerifyJWKS)
+		}
+		if cs.JWTAudience != "" {
+			return fmt.Errorf("jwtAudience is set but jwtVerify=%q for setting %q; jwtAudience is only valid when jwtVerify=%q",
+				CustomSettingJWTVerifyNone, cs.Setting, CustomSettingJWTVerifyJWKS)
+		}
+
+	case CustomSettingJWTVerifyJWKS:
+		// verify=jwks: JWKS URL is required and must use https.
+		if cs.JWTJWKSURL == "" {
+			return fmt.Errorf("source=jwt with jwtVerify=jwks requires non-empty jwtJwksUrl for setting %q", cs.Setting)
+		}
+		u, parseErr := url.Parse(cs.JWTJWKSURL)
+		if parseErr != nil {
+			return fmt.Errorf("invalid jwtJwksUrl for setting %q: %w", cs.Setting, parseErr)
+		}
+		if u.Scheme != "https" {
+			return fmt.Errorf("jwtJwksUrl for setting %q must use https scheme, got %q", cs.Setting, u.Scheme)
+		}
+		// issuer and audience are optional but must not have leading/trailing whitespace.
+		if cs.JWTIssuer != strings.TrimSpace(cs.JWTIssuer) {
+			return fmt.Errorf("jwtIssuer for setting %q must not have leading or trailing whitespace", cs.Setting)
+		}
+		if cs.JWTAudience != strings.TrimSpace(cs.JWTAudience) {
+			return fmt.Errorf("jwtAudience for setting %q must not have leading or trailing whitespace", cs.Setting)
+		}
+
+	default:
+		return fmt.Errorf("unknown jwtVerify %q for setting %q; accepted values: %q, %q",
+			cs.JWTVerify, cs.Setting, CustomSettingJWTVerifyNone, CustomSettingJWTVerifyJWKS)
+	}
+
+	return nil
+}
+
+// validateJWTClaimPath validates a dotted claim path. Empty segments, leading/
+// trailing dots, and consecutive dots are all rejected to prevent ambiguous
+// path resolution.
+func validateJWTClaimPath(path string) error {
+	if strings.HasPrefix(path, ".") || strings.HasSuffix(path, ".") {
+		return fmt.Errorf("must not have leading or trailing dots")
+	}
+	if strings.Contains(path, "..") {
+		return fmt.Errorf("must not contain consecutive dots (..)")
+	}
+	for _, seg := range strings.Split(path, ".") {
+		if seg == "" {
+			return fmt.Errorf("must not contain empty path segments")
+		}
+	}
+	return nil
 }
 
 // loadHttpHeaders loads secure and plain text headers from the config

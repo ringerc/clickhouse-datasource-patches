@@ -4,7 +4,9 @@ go 1.26.5
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.47.0
+	github.com/MicahParks/keyfunc/v3 v3.8.0
 	github.com/docker/go-units v0.5.0
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/grafana/grafana-plugin-sdk-go v0.293.0
 	github.com/grafana/macropro v1.0.1
 	github.com/grafana/sqlds/v5 v5.3.0
@@ -15,9 +17,11 @@ require (
 	github.com/testcontainers/testcontainers-go v0.43.0
 	golang.org/x/net v0.57.0
 	golang.org/x/sync v0.22.0
+	golang.org/x/time v0.15.0
 )
 
 require (
+	github.com/MicahParks/jwkset v0.11.0 // indirect
 	github.com/apache/arrow-go/v18 v18.6.0 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect

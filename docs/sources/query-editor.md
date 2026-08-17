@@ -39,6 +39,10 @@ The query editor appears in [Explore](https://grafana.com/docs/grafana/latest/vi
 - **Format code** — Use the editor toolbar to format your SQL.
 - **Query type** — Select **Table**, **Logs**, **Time series**, or **Traces** so the panel uses the correct visualization.
 
+{{< admonition type="note" >}}
+When the data source is configured with enforced server-side settings or the **Enforce read-only on all queries** toggle is enabled, any `SET` statement or `SETTINGS` clause in your SQL that modifies a non-whitelisted setting will be rejected by ClickHouse with a readonly error. Settings explicitly marked as `CHANGEABLE_IN_READONLY` on the server (such as `max_threads`) can still be tuned per query. For details, refer to [Enforcing server-side settings (multi-tenancy)](/docs/plugins/grafana-clickhouse-datasource/<CLICKHOUSE_PLUGIN_VERSION>/configure/#enforcing-server-side-settings-multi-tenancy).
+{{< /admonition >}}
+
 **In Query builder mode:**
 
 - **Database** and **Table** — Select the database and table to query from the drop-downs.

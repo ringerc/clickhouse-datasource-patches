@@ -89,6 +89,10 @@ If you see errors such as `DB::Exception: Cannot modify 'max_execution_time': Se
 If you use a **public ClickHouse instance**, do not set `readonly = 2`. Keep `readonly = 1` and use the `changeable_in_readonly` constraint described above.
 {{< /admonition >}}
 
+{{< admonition type="note" >}}
+The **Enforce read-only on all queries** toggle and the per-row **Enforced** checkboxes in the data source **Custom Settings** table are a separate, additive mechanism from the server-side profile `readonly` setting. They inject `readonly=1` per-query rather than relying on the ClickHouse user's profile. For this to work, the connecting user must not already have `readonly = 1` enforced at the profile level — use `readonly = 0` or `readonly = 2` instead. See [Enforcing server-side settings (multi-tenancy)](#enforcing-server-side-settings-multi-tenancy) for details.
+{{< /admonition >}}
+
 ## ClickHouse protocol support
 
 The data source supports two transport protocols: **Native** (default) and **HTTP**. Both support the same query capabilities. The Native protocol uses ClickHouse's binary TCP interface for better performance. HTTP uses the ClickHouse HTTP interface, which is useful when your network requires HTTP-based connectivity (for example, through a reverse proxy or load balancer).
@@ -190,7 +194,152 @@ Use **Single source** when the data source is dedicated to one logs or traces ta
 
 You can pass arbitrary ClickHouse `SETTINGS` with every query by adding key-value pairs in the **Custom Settings** section. For example, you can set `max_block_size` or `max_threads` to tune query performance.
 
-These settings are appended to each query's `SETTINGS` clause. They do not replace any settings that the plugin sets internally (such as `max_execution_time`).
+These settings are appended to each query's `SETTINGS` clause. They do not replace any settings that the plugin sets internally (such as `max_execution_time`). To make specific settings tamper-resistant so that end users cannot override them in their SQL, see [Enforcing server-side settings (multi-tenancy)](#enforcing-server-side-settings-multi-tenancy).
+
+### Enforcing server-side settings (multi-tenancy)
+
+The **Enforced** checkbox on each Custom Setting row enables a tamper-resistant mode: the datasource sends the setting alongside `readonly=1` on every query, so the end user's SQL cannot override it with a `SETTINGS` or `SET` clause.
+
+When any custom setting is marked **Enforced**, the **Enforce read-only on all queries** toggle is automatically enabled. You can also enable that toggle independently to make the datasource fully read-only (SELECT/SHOW only) without any enforced settings.
+
+**How it works (no SQL rewriting, no dedicated DB user):**
+
+The plugin injects the enforced settings and `readonly=1` as per-query settings out-of-band with the SQL — via HTTP query-string parameters or the Native protocol's per-query settings block. ClickHouse enforces two invariants that make this tamper-resistant:
+
+1. `readonly` can only be increased per query; a user's `SETTINGS readonly=0` is rejected once it is already `1`.
+2. Under `readonly=1`, any `SETTINGS foo=…` or `SET foo=…` in the user's SQL that attempts to change a non-whitelisted setting is rejected outright.
+
+**Worked example — row-level multi-tenancy:**
+
+```sql
+-- 1. Create a row policy that reads the enforced setting
+CREATE ROW POLICY tenant_filter ON mydb.events
+  USING has(splitByChar(',', getSetting('custom_visible_tenants')), tenant_id)
+  TO grafana_user;
+
+-- 2. In the datasource config, add a Custom Setting:
+--    setting = custom_visible_tenants
+--    value   = t1,t2          (the tenants this datasource instance may see)
+--    enforced = ✓ (checked)
+```
+
+With `readonly=1` active, the user cannot change `custom_visible_tenants` in their query, so the row policy always filters on the operator-supplied tenant list.
+
+**Important caveats:**
+
+- **Enforced settings must NOT be marked `CHANGEABLE_IN_READONLY` on the ClickHouse server.** If they are, a user can override them even under `readonly=1`, which collapses the enforcement guarantee. The `<changeable_in_readonly/>` server-side tag is intended only for tunables like `max_threads` and `max_memory_usage` that operators want to allow users to tune per query.
+- Enabling this feature makes the datasource **read-only**: INSERT, CREATE, ALTER, and other write statements from Grafana will be rejected by ClickHouse.
+- The connecting DB user must start at `readonly=0` (or `readonly=2`). If the user's server profile already enforces `readonly=1`, the plugin cannot inject the enforced setting values before that restriction takes effect.
+
+#### Header-sourced values
+
+Instead of embedding a static value in the datasource configuration, an enforced setting can read its value from a named HTTP request header on each query. This allows per-user or per-tenant values to be injected by a trusted upstream proxy — for example, an identity-aware gateway that sets `X-Allowed-Projects` based on the authenticated user's entitlements.
+
+To enable header-sourced binding, set the **Source** field to **Request header** on an enforced custom setting row and fill in the **Header name** field. The **Value** field must be left empty (the backend rejects non-empty values in this mode). The **On missing** field controls what happens when the header is absent: **Reject query** (default) fails the query with a descriptive error; **Treat as empty** sends an empty string to ClickHouse.
+
+The equivalent `jsonData.customSettings` entry in a provisioning file looks like:
+
+```yaml
+jsonData:
+  customSettings:
+    - setting: custom_visible_tenants
+      value: ''
+      enforced: true
+      source: header
+      headerName: X-Allowed-Projects
+      onMissing: reject
+```
+
+**Trust model — this mode requires a trusted upstream proxy.** The header value arrives as a plain HTTP header alongside the Grafana dashboard request. Nothing in the plugin prevents a browser from supplying arbitrary header values unless a trusted proxy unconditionally overwrites the header on every request before it reaches Grafana. Without that guarantee, any user can spoof the header and bypass the row policy. Only use this mode when:
+
+1. All traffic to Grafana passes through a proxy that you control.
+2. That proxy **unconditionally** sets the header on every request (not merely adds it when absent).
+3. The proxy enforces authentication before setting the header.
+
+**Enabling Grafana header forwarding.** Grafana must be configured to pass the header through to backend datasource plugins. Set `send_user_header = true` in `grafana.ini` (for Grafana-minted user headers such as `X-Grafana-User`) or use the datasource-level **Forward Grafana HTTP Headers** toggle to pass headers from the incoming request to the plugin. For custom headers coming from an upstream proxy, ensure the header name appears in Grafana's `allowed_headers` list (see the [Grafana configuration docs](https://grafana.com/docs/grafana/latest/setup-grafana/configure-grafana/)). Without this, the header will be stripped before it reaches the plugin and every query will be rejected with "value not present on the request".
+
+**Example — binding `custom_visible_tenants` to `X-Allowed-Projects`:**
+
+```sql
+-- ClickHouse row policy (created once by an operator)
+CREATE ROW POLICY tenant_filter ON mydb.events
+  USING has(splitByChar(',', getSetting('custom_visible_tenants')), tenant_id)
+  TO grafana_user;
+```
+
+When a dashboard query arrives with `X-Allowed-Projects: prj_a,prj_b`, the plugin resolves the header value and injects `custom_visible_tenants='prj_a,prj_b'` alongside `readonly=1` before sending the query to ClickHouse. The row policy then restricts the result set to rows matching those project IDs. The end user's SQL cannot override `custom_visible_tenants` because `readonly=1` is already active.
+
+#### JWT-claim-sourced values
+
+Instead of a plain header value, an enforced setting can read its value from a _claim inside a signed JWT token_ carried by a named HTTP header. This provides a stronger trust model than plain header binding because the token's contents can be cryptographically verified.
+
+To enable JWT-claim binding, set the **Source** field to **JWT claim** on an enforced custom setting row and fill in the **Claim path** field with the dot-separated claim key (e.g. `tenants`). The **Token header** field specifies which HTTP header carries the JWT; it defaults to `X-Grafana-Id` when left blank. The **Array join** field sets the separator used to join array-valued claims into a single string (defaults to `,`). The **On missing** field controls behaviour when no token is present: **Reject query** (default) or **Treat as empty**.
+
+The corresponding `jsonData.customSettings` provisioning entry looks like:
+
+```yaml
+jsonData:
+  customSettings:
+    - setting: custom_visible_tenants
+      value: ''
+      enforced: true
+      source: jwt
+      jwtHeaderName: X-Grafana-Id   # optional; defaults to X-Grafana-Id
+      jwtClaim: tenants             # required
+      jwtClaimJoin: ','             # optional; defaults to ","
+      jwtVerify: none               # "none" (default) or "jwks"
+      onMissing: reject             # "reject" (default) or "empty"
+```
+
+**Signature verification.** By default (`jwtVerify: none`) the plugin trusts the forwarded token without checking its signature. This is appropriate when the token source is already trusted (e.g. Grafana's own `X-Grafana-Id` token, which Grafana signs itself). To verify the signature against a JWKS endpoint — recommended when the token comes from an external IdP or when defence-in-depth is required — set `jwtVerify: jwks` and provide the additional fields:
+
+```yaml
+      jwtVerify: jwks
+      jwtJwksUrl: https://idp.example/.well-known/jwks.json   # required
+      jwtIssuer: https://idp.example                          # optional
+      jwtAudience: grafana                                    # optional
+```
+
+**Trust model.** The appropriate token header and verification strategy depend on the token source:
+
+- **`X-Grafana-Id` (Grafana-minted signed ID token).** Grafana can forward its internal per-request ID token to backend plugins. This token is signed by Grafana's own key; verify it using Grafana's `/api/signing-keys/keys` JWKS endpoint. You must enable the `idForwarding` feature toggle in Grafana (`[feature_toggles] idForwarding = true`) for the header to be populated.
+
+- **OAuth ID token or Bearer token (`Authorization` header).** When the user authenticates to Grafana via OAuth/OIDC, Grafana can forward the original ID token to backend plugins. Enable the datasource-level **Forward OAuth Identity** toggle. Verify the token using the IdP's published JWKS (e.g. `https://idp.example/.well-known/jwks.json`).
+
+**Enabling Grafana to forward tokens to backend plugins.** In addition to enabling the relevant toggle, ensure that the token header name (e.g. `X-Grafana-Id`) is not stripped by any intermediate proxy. For the `Authorization` header, the **Forward OAuth Identity** toggle on the datasource handles forwarding automatically.
+
+**Example — binding `custom_visible_tenants` to the `tenants` claim in `X-Grafana-Id`, no signature verification:**
+
+```yaml
+jsonData:
+  customSettings:
+    - setting: custom_visible_tenants
+      value: ''
+      enforced: true
+      source: jwt
+      jwtHeaderName: X-Grafana-Id
+      jwtClaim: tenants
+      jwtVerify: none
+      onMissing: reject
+```
+
+**Example — same binding with JWKS verification against an external IdP:**
+
+```yaml
+jsonData:
+  customSettings:
+    - setting: custom_visible_tenants
+      value: ''
+      enforced: true
+      source: jwt
+      jwtHeaderName: X-Grafana-Id
+      jwtClaim: tenants
+      jwtVerify: jwks
+      jwtJwksUrl: https://idp.example/.well-known/jwks.json
+      jwtIssuer: https://idp.example
+      jwtAudience: grafana
+      onMissing: reject
+```
 
 ### Logs configuration
 

@@ -273,6 +273,66 @@ For more details on configuring permissions, refer to [ClickHouse user and permi
 
 ---
 
+Query rejected — enforced settings or read-only mode
+
+**Error message:** "query rejected: this datasource enforces server-side ClickHouse settings and runs queries under readonly=1; SET/SETTINGS clauses that change server settings are not allowed. Original error: [original ClickHouse error]"
+
+**Cause:** The data source is configured with one or more **Enforced** custom settings or with the **Enforce read-only on all queries** toggle enabled. ClickHouse returns error code 164 (READONLY) when the user's SQL contains a `SET` statement or a `SETTINGS` clause that attempts to modify a non-whitelisted setting.
+
+**Solution:** This is intentional behaviour. If a user legitimately needs to tune a specific setting per query (for example, `max_threads`), ask an operator to mark that setting as `CHANGEABLE_IN_READONLY` in the server-side settings profile for the Grafana user. Do **not** apply `CHANGEABLE_IN_READONLY` to any setting that is also marked **Enforced** in the data source, as that would allow users to override the enforced value.
+
+For configuration details, refer to [Enforcing server-side settings (multi-tenancy)](/docs/plugins/grafana-clickhouse-datasource/<CLICKHOUSE_PLUGIN_VERSION>/configure/#enforcing-server-side-settings-multi-tenancy).
+
+---
+
+Unknown setting custom\_\<name\>
+
+**Error message:** "DB::Exception: Unknown setting 'custom_\<name\>'"
+
+**Cause:** The ClickHouse server does not have the `custom_` prefix registered in its configuration, so it rejects any setting whose name starts with `custom_`.
+
+**Solution:**
+
+1. Add the following element to the ClickHouse server configuration (usually `config.xml` or a drop-in file in `config.d/`):
+   ```xml
+   <custom_settings_prefixes>custom_</custom_settings_prefixes>
+   ```
+2. Reload or restart ClickHouse for the change to take effect.
+3. Verify by running `SELECT getSetting('custom_test')` as the Grafana user. An "Unknown setting" error means the prefix is still not registered; a `NULL` result means it is.
+
+For more information, refer to the [ClickHouse custom settings documentation](https://clickhouse.com/docs/operations/settings/settings#custom_settings_prefixes).
+
+---
+
+Health check fails — enforced setting is still overridable
+
+**Symptoms:** The data source health check fails with a message indicating that the override-rejection probe did not work as expected, or that an enforced setting can still be changed by a query.
+
+**Cause:** The enforced setting has been marked `<changeable_in_readonly/>` in a server-side settings profile constraint, which allows it to be changed even under `readonly=1` and defeats the enforcement guarantee.
+
+**Solution:**
+
+1. Identify which settings are marked **Enforced** in the data source **Custom Settings** table.
+2. In the ClickHouse server settings profile for the Grafana user, remove the `CHANGEABLE_IN_READONLY` constraint from every setting that is marked **Enforced**.
+3. The `CHANGEABLE_IN_READONLY` tag is safe to keep on user-tunable settings such as `max_threads` or `max_memory_usage` — only enforced settings must not carry it.
+
+---
+
+Health check fails — plugin cannot inject enforced settings (connecting user is already readonly)
+
+**Symptoms:** The data source health check fails with a startup or connection readonly error, or enforced setting values are not applied to queries.
+
+**Cause:** The connecting ClickHouse user has `readonly = 1` set at the profile or user level. Because `readonly` can only be increased per query, the plugin cannot inject the enforced setting values before that restriction takes effect.
+
+**Solution:**
+
+1. Configure the connecting ClickHouse user's profile with `readonly = 0` or `readonly = 2` at the server level.
+2. The plugin will apply `readonly = 1` per-query automatically when enforced settings or the **Enforce read-only on all queries** toggle are enabled.
+
+For setup details, refer to [Enforcing server-side settings (multi-tenancy)](/docs/plugins/grafana-clickhouse-datasource/<CLICKHOUSE_PLUGIN_VERSION>/configure/#enforcing-server-side-settings-multi-tenancy).
+
+---
+
 ### Query Builder Issues
 
 Empty Database, Table, or Column Dropdowns
@@ -672,6 +732,99 @@ Connection Pool Saturation (Sudden Slowness)
    ```
 3. Monitor the ClickHouse server's `system.metrics` table (`CurrentMetric_TCPConnection`) to see whether the connection count from Grafana is approaching the server-side limit.
 4. If using HTTP protocol, check whether a reverse proxy between Grafana and ClickHouse has its own connection limits.
+
+---
+
+### Query rejected — header-sourced enforced setting value not present on the request
+
+**Symptoms:** Queries fail with an error similar to:
+
+```
+query rejected: required value for enforced setting 'custom_visible_tenants' was not present on the request (source=header, header=X-Allowed-Projects)
+```
+
+**Cause:** The datasource has an enforced custom setting with `source: header`, but the named HTTP header was not present on the incoming request when the query was executed.
+
+**Common causes and remediation:**
+
+1. **Grafana is not forwarding the header to the backend plugin.** The header may be present in the browser request but stripped by Grafana before it reaches the datasource plugin. Check that the header name appears in Grafana's `allowed_headers` list, or that the **Forward Grafana HTTP Headers** toggle is enabled in the datasource configuration. See [Enabling Grafana header forwarding](configure.md#header-sourced-values) for details.
+
+2. **The upstream proxy is not setting the header.** Verify that the proxy unconditionally sets the header on every request and that it is doing so before the request reaches Grafana. Check the proxy access logs to confirm the header is present.
+
+3. **Wrong `headerName` in the datasource configuration.** Header names are canonicalised server-side (e.g. `x-allowed-projects` → `X-Allowed-Projects`). Confirm the `headerName` field in the datasource configuration exactly matches the canonical form of the header the proxy sends.
+
+4. **Header absent on non-browser requests** (e.g. alerting or scheduled reports). These requests may bypass the proxy or use a service account that does not carry the header. If you need the setting to fall through to an empty value rather than rejecting the query, change **On missing** from **Reject query** to **Treat as empty** in the datasource configuration (note that this may expose unfiltered data if the row policy is not designed to handle empty values).
+
+To confirm the header is arriving at the plugin, enable Grafana's debug logging and look for an `info`-level log line from the plugin:
+
+```
+msg="resolved enforced setting" setting=custom_visible_tenants source=header header=X-Allowed-Projects value=prj_a,prj_b
+```
+
+If the log line is absent, the header is being stripped before it reaches the plugin.
+
+---
+
+### Query rejected — JWT in header was missing or malformed
+
+**Symptoms:** Queries fail with an error similar to:
+
+```
+query rejected: JWT in header 'X-Grafana-Id' was missing or could not be parsed (source=jwt, setting=custom_visible_tenants)
+```
+
+**Cause:** The datasource has an enforced custom setting with `source: jwt`, but the named HTTP header was absent, empty, or did not contain a parseable JWT on the incoming request.
+
+**Common causes and remediation:**
+
+1. **Grafana is not forwarding the token header to the backend plugin.** For `X-Grafana-Id`, ensure the `idForwarding` feature toggle is enabled in Grafana (`[feature_toggles] idForwarding = true`). For OAuth ID tokens forwarded via `Authorization`, enable the **Forward OAuth Identity** toggle on the datasource. Check that no intermediate proxy strips the header before it reaches the plugin.
+
+2. **Wrong `jwtHeaderName` in the datasource configuration.** Header names are canonicalised server-side. Confirm that the `jwtHeaderName` field exactly matches the canonical form of the header (e.g. `X-Grafana-Id`, not `x-grafana-id`).
+
+3. **The token header is present but the value is not a valid JWT.** Verify that the header contains a compact-serialised JWT (three dot-separated Base64url parts). Check the upstream system that injects the token.
+
+4. **Header absent on non-browser requests** (e.g. alerting or scheduled reports). These requests may not carry the token. If the setting should fall through to an empty value, set **On missing** to **Treat as empty** (note: this may expose unfiltered data if the row policy is not designed to handle empty values).
+
+---
+
+### JWT signature verification failed
+
+**Symptoms:** Queries fail with an error similar to:
+
+```
+query rejected: jwt signature verification failed for setting 'custom_visible_tenants': <sub-error>
+```
+
+The sub-error indicates the specific failure. Common sub-errors and their remediation:
+
+- **`unknown kid` / `no matching key`** — The JWT's `kid` header does not match any key in the JWKS response. The signing key may have been rotated. Check that the `jwtJwksUrl` points to the current JWKS endpoint and that the IdP has published the new key. The plugin fetches the JWKS on each verification; if the endpoint is reachable, key rotation is picked up automatically.
+
+- **`token is expired`** — The JWT's `exp` claim is in the past. This can occur if Grafana is not refreshing forwarded tokens or if the token lifetime is very short. Check the token TTL on the issuing system.
+
+- **`iss claim mismatch`** — The token's `iss` claim does not match the `jwtIssuer` configured in the datasource. Verify the `jwtIssuer` value and compare it against the actual `iss` in the JWT payload (decode the Base64url middle segment to inspect the claims).
+
+- **`aud claim mismatch`** — The token's `aud` claim does not contain the expected audience. Verify the `jwtAudience` value configured in the datasource.
+
+- **`JWKS endpoint unreachable`** — See [JWKS URL is unreachable](#health-check-fails--jwks-url-is-unreachable) below.
+
+---
+
+### Health check fails — JWKS URL is unreachable
+
+**Symptoms:** The data source health check fails with a message such as:
+
+```
+health check failed: JWKS URL 'https://idp.example/.well-known/jwks.json' is unreachable: <network error>
+```
+
+**Cause:** The plugin could not fetch the JWKS document from the configured `jwtJwksUrl` during the health check probe.
+
+**Remediation:**
+
+1. Verify that the JWKS URL is correct and reachable from the Grafana server (not just from the browser). Use `curl` from the Grafana host to confirm: `curl -v https://idp.example/.well-known/jwks.json`.
+2. Check for firewall rules or network policies that may block outbound HTTPS from the Grafana server to the IdP.
+3. Ensure the URL uses HTTPS. HTTP JWKS endpoints are rejected.
+4. If the IdP uses a custom CA certificate, ensure the Grafana server's trust store includes it.
 
 ---
 

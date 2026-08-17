@@ -29,6 +29,7 @@ The ClickHouse data source plugin allows you to query and visualize ClickHouse d
 | Annotations                  | Yes                    |
 | Template variables           | Yes                    |
 | Ad hoc filters               | Yes (ClickHouse 22.7+) |
+| Enforced server-side settings and read-only mode | Yes |
 | Private Data Connect (PDC)   | Yes (Grafana Cloud)    |
 
 ## Requirements
@@ -62,6 +63,7 @@ After configuring the data source, you can:
 - Use [Explore](https://grafana.com/docs/grafana/latest/explore/) to query data without building a dashboard
 - Add [Transformations](https://grafana.com/docs/grafana/latest/panels/transformations/) to manipulate query results
 - Set up [Alerting](https://grafana.com/docs/grafana/latest/alerting/) rules
+- Enforce ClickHouse server-side settings — such as a multi-tenant filter variable — that users cannot override in their SQL. See [Enforcing server-side settings (multi-tenancy)](/docs/plugins/grafana-clickhouse-datasource/<CLICKHOUSE_PLUGIN_VERSION>/configure/#enforcing-server-side-settings-multi-tenancy).
 
 ## Pre-built dashboards
 
