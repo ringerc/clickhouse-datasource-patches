@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
+	keyfunc "github.com/MicahParks/keyfunc/v3"
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 )
 
@@ -195,6 +196,17 @@ func runEnforcedHealthProbes(ctx context.Context, s Settings, p dbProber) *backe
 // that opens a short-lived probe connection and runs runEnforcedHealthProbes.
 func makeEnforcedSettingsHealthCheck(s Settings, instanceSettings backend.DataSourceInstanceSettings) func(context.Context, *backend.CheckHealthRequest) *backend.CheckHealthResult {
 	return func(ctx context.Context, req *backend.CheckHealthRequest) *backend.CheckHealthResult {
+		// Gate: if any dynamic-source binding depends on a header that is
+		// not always forwarded, the datasource "Forward Grafana HTTP
+		// Headers" toggle must be on. Otherwise the header will never
+		// reach the plugin and every request will fall through to
+		// OnMissing (either silently blanking the setting or hard-failing
+		// the query). Surface this as a health-check error so operators
+		// notice it before end users hit it.
+		if result := checkForwardHeadersGate(s); result != nil {
+			return result
+		}
+
 		// Use a fresh connection so the probe is independent of the pooled connection
 		// and does not interfere with in-flight queries.
 		plugin := Clickhouse{}
@@ -288,20 +300,86 @@ func makeEnforcedSettingsHealthCheck(s Settings, instanceSettings backend.DataSo
 	}
 }
 
-// probeJWKSURL performs a GET request to url and returns an error if it is
-// unreachable or returns a non-2xx status.
+// probeJWKSURL performs an end-to-end JWKS fetch: it uses the same keyfunc
+// library the runtime uses to verify tokens and reports an error if either
+// the HTTP fetch or the JWK Set parse fails. This is stronger than a raw
+// GET because it exercises the exact code path (headers, decoding, key
+// requirement checks) that a real query would trigger — a JWKS URL that
+// serves the wrong content type, empty JSON, or an invalid key set will
+// fail here even though a plain GET would return HTTP 200.
+//
+// The context timeout gates both the fetch and the parse; on success the
+// underlying background refresh goroutine is immediately cancelled so the
+// probe leaves no goroutines behind.
 func probeJWKSURL(ctx context.Context, url string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return fmt.Errorf("build request: %w", err)
-	}
-	resp, err := http.DefaultClient.Do(req)
+	probeCtx, cancel := context.WithCancel(ctx)
+	defer cancel() // terminates the keyfunc refresh goroutine on return
+
+	client := &http.Client{Timeout: jwksFetchTimeout}
+	noErrFirst := false
+	kf, err := keyfunc.NewDefaultOverrideCtx(probeCtx, []string{url}, keyfunc.Override{
+		Client:                    client,
+		HTTPTimeout:               jwksFetchTimeout,
+		RefreshInterval:           jwksRefreshInterval,
+		NoErrorReturnFirstHTTPReq: &noErrFirst,
+	})
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	// Sanity check: the key set must contain at least one key. An empty
+	// JWKS ({"keys":[]}) parses without error but would fail every
+	// verification at query time.
+	keys, err := kf.Storage().KeyReadAll(probeCtx)
+	if err != nil {
+		return fmt.Errorf("read JWKS keys: %w", err)
+	}
+	if len(keys) == 0 {
+		return fmt.Errorf("JWKS document contains no keys")
 	}
 	return nil
+}
+
+// checkForwardHeadersGate returns a health-check error when any enforced
+// binding depends on a header that is not always forwarded to plugins and
+// the "Forward Grafana HTTP Headers" toggle is off. Returns nil when the
+// configuration is consistent.
+func checkForwardHeadersGate(s Settings) *backend.CheckHealthResult {
+	if s.ForwardGrafanaHeaders {
+		return nil
+	}
+	var offenders []string
+	for _, cs := range s.CustomSettings {
+		if !cs.Enforced {
+			continue
+		}
+		var header string
+		switch cs.Source {
+		case customSettingSourceHeader:
+			header = http.CanonicalHeaderKey(cs.HeaderName)
+		case CustomSettingSourceJWT:
+			name := cs.JWTHeaderName
+			if name == "" {
+				name = defaultJWTHeaderName
+			}
+			header = http.CanonicalHeaderKey(name)
+		default:
+			continue
+		}
+		if header == "" || headerIsAlwaysForwarded(header) {
+			continue
+		}
+		offenders = append(offenders, fmt.Sprintf("%q (header %q)", cs.Setting, header))
+	}
+	if len(offenders) == 0 {
+		return nil
+	}
+	return &backend.CheckHealthResult{
+		Status: backend.HealthStatusError,
+		Message: fmt.Sprintf(
+			"Enforced setting(s) %s depend on a header that Grafana does not forward to plugins by default. "+
+				"Enable \"Forward Grafana HTTP Headers\" on the datasource, or point the binding at one of the "+
+				"always-forwarded headers (X-Grafana-Id, X-Dashboard-Uid, X-Panel-Id, X-Rule-Uid, X-Datasource-Uid).",
+			strings.Join(offenders, ", "),
+		),
+	}
 }

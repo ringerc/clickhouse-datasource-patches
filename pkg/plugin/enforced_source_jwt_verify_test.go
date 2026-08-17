@@ -174,6 +174,22 @@ func TestJWTVerifyJWKS_ExpiredToken(t *testing.T) {
 	assert.Contains(t, err.Error(), "expired")
 }
 
+// Under verify=jwks the operator has opted into strict verification.
+// A malformed token cannot be verified, so it must hard-fail regardless of
+// OnMissing — otherwise OnMissing=empty would silently let unverifiable
+// tokens through.
+func TestJWTVerifyJWKS_MalformedToken_HardFails(t *testing.T) {
+	jwksData := buildJWKSJSON(testRSAKeyID, &testRSAKey.PublicKey)
+	srv, _ := jwksTestServer(t, jwksData)
+
+	src := makeJWKSSource(t, srv, "tenant", "tenants", "", "")
+
+	ctx := jwtCtx("X-Token", "not.a.valid.jwt")
+	_, ok, err := src.Resolve(ctx)
+	assert.Error(t, err, "malformed JWT under verify=jwks must hard-fail")
+	assert.False(t, ok)
+}
+
 func TestJWTVerifyJWKS_WrongSignature(t *testing.T) {
 	// Sign with one key, serve JWKS with a different key.
 	otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -337,3 +353,20 @@ func TestJWKSCache_FailureCached(t *testing.T) {
 
 // Ensure we use encoding/json in this test file.
 var _ = json.Marshal
+
+func TestJWKSCache_CloseCancelsContext(t *testing.T) {
+	cache := newJWKSCache(nil)
+	require.NotNil(t, cache.ctx)
+	require.NoError(t, cache.ctx.Err(), "ctx should not be cancelled on construction")
+
+	cache.close()
+	assert.Error(t, cache.ctx.Err(), "ctx must be cancelled after close()")
+
+	// close() must be safe to call multiple times.
+	cache.close()
+	cache.close()
+
+	// nil-safe.
+	var nilCache *jwksCache
+	nilCache.close()
+}

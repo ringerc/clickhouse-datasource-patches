@@ -32,22 +32,45 @@ const (
 //
 // Negative-failure entries are retained for jwksFailureCacheTTL to avoid
 // hammering an unreachable JWKS endpoint; after the TTL the next call retries.
+//
+// The cache owns a cancellable context that is passed to
+// keyfunc.NewDefaultOverrideCtx so background refresh goroutines terminate
+// when close() is called (typically from clickhouseInstance.Dispose).
 type jwksCache struct {
-	mu       sync.Mutex
-	entries  map[string]keyfunc.Keyfunc
-	failures map[string]time.Time
-	client   *http.Client
+	mu        sync.Mutex
+	entries   map[string]keyfunc.Keyfunc
+	failures  map[string]time.Time
+	client    *http.Client
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeOnce sync.Once
 }
 
 func newJWKSCache(client *http.Client) *jwksCache {
 	if client == nil {
 		client = http.DefaultClient
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &jwksCache{
 		entries:  make(map[string]keyfunc.Keyfunc),
 		failures: make(map[string]time.Time),
 		client:   client,
+		ctx:      ctx,
+		cancel:   cancel,
 	}
+}
+
+// close cancels the background refresh context for every Keyfunc created via
+// this cache, terminating their goroutines. Safe to call multiple times; nil-safe.
+func (c *jwksCache) close() {
+	if c == nil {
+		return
+	}
+	c.closeOnce.Do(func() {
+		if c.cancel != nil {
+			c.cancel()
+		}
+	})
 }
 
 // getOrCreate returns the cached keyfunc.Keyfunc for url, creating it on
@@ -71,7 +94,7 @@ func (c *jwksCache) getOrCreate(url string) (keyfunc.Keyfunc, error) {
 	c.mu.Unlock()
 
 	// Build outside the lock; initial HTTP fetch may take up to jwksFetchTimeout.
-	kf, err := buildJWKSKeyfunc(url, c.client)
+	kf, err := buildJWKSKeyfunc(c.ctx, url, c.client)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -92,8 +115,9 @@ func (c *jwksCache) getOrCreate(url string) (keyfunc.Keyfunc, error) {
 // buildJWKSKeyfunc creates a keyfunc.Keyfunc for url. The initial HTTP fetch
 // is performed synchronously (up to jwksFetchTimeout); a background goroutine
 // refreshes the key set every jwksRefreshInterval thereafter. The goroutine
-// runs for the process lifetime (context.Background()).
-func buildJWKSKeyfunc(url string, client *http.Client) (keyfunc.Keyfunc, error) {
+// runs until ctx is cancelled — pass the jwksCache-owned ctx so Dispose can
+// terminate it.
+func buildJWKSKeyfunc(ctx context.Context, url string, client *http.Client) (keyfunc.Keyfunc, error) {
 	noErrFirst := false // fail fast on initial fetch failure
 	unk := rate.NewLimiter(rate.Every(5*time.Minute), 1)
 	override := keyfunc.Override{
@@ -103,7 +127,7 @@ func buildJWKSKeyfunc(url string, client *http.Client) (keyfunc.Keyfunc, error) 
 		RefreshUnknownKID:         unk,
 		NoErrorReturnFirstHTTPReq: &noErrFirst,
 	}
-	return keyfunc.NewDefaultOverrideCtx(context.Background(), []string{url}, override)
+	return keyfunc.NewDefaultOverrideCtx(ctx, []string{url}, override)
 }
 
 // ---------------------------------------------------------------------------
@@ -171,8 +195,40 @@ func (j *jwtValueSource) Resolve(ctx context.Context) (string, bool, error) {
 		var parseErr error
 		parsedToken, _, parseErr = parser.ParseUnverified(token, &mc)
 		if parseErr != nil {
-			return "", false, fmt.Errorf("jwt in header %q for setting %q is malformed: %w",
-				j.headerName, j.settingName, parseErr)
+			// Under verify=none the operator has explicitly opted OUT of strict
+			// verification. Treat a malformed token as "value absent" so the
+			// OnMissing policy (reject | empty) decides the outcome — otherwise
+			// OnMissing=empty would be silently ignored on broken tokens.
+			backend.Logger.Warn("jwt in header is malformed; treating as absent (verify=none)",
+				"setting", j.settingName,
+				"header", j.headerName,
+				"error", parseErr,
+			)
+			return "", false, nil
+		}
+		// Enforce `exp` even under verify=none for any header other than
+		// X-Grafana-Id. Grafana validates upstream OAuth tokens at login
+		// only — it does NOT re-verify at forward time, and cached IdP
+		// tokens routinely outlive their `exp` by hours. Binding a
+		// server-side ClickHouse setting to a stale claim is worse than
+		// having no claim: treat expiry as "absent" so the OnMissing
+		// policy decides. X-Grafana-Id is exempt because Grafana re-mints
+		// it per request and its lifetime is a Grafana concern.
+		if !isTrustedGrafanaHeader(j.headerName) {
+			if expired, err := jwtIsExpired(mc); err != nil {
+				backend.Logger.Warn("jwt in header has malformed exp claim; treating as absent (verify=none)",
+					"setting", j.settingName,
+					"header", j.headerName,
+					"error", err,
+				)
+				return "", false, nil
+			} else if expired {
+				backend.Logger.Warn("jwt in header is expired; treating as absent (verify=none, non-trusted header)",
+					"setting", j.settingName,
+					"header", j.headerName,
+				)
+				return "", false, nil
+			}
 		}
 		claims = mc
 
@@ -241,7 +297,7 @@ func (j *jwtValueSource) Resolve(ctx context.Context) (string, bool, error) {
 		sub, _ = parsedToken.Claims.GetSubject()
 		iss, _ = parsedToken.Claims.GetIssuer()
 	}
-	backend.Logger.Info("resolved enforced setting from jwt",
+	backend.Logger.Debug("resolved enforced setting from jwt",
 		"setting", j.settingName,
 		"header", j.headerName,
 		"claim", j.ClaimPath(),
@@ -249,6 +305,42 @@ func (j *jwtValueSource) Resolve(ctx context.Context) (string, bool, error) {
 		"iss", iss,
 	)
 	return val, true, nil
+}
+
+// isTrustedGrafanaHeader reports whether the (canonicalised) header name is
+// one that Grafana mints itself per request and whose freshness is therefore
+// Grafana's concern rather than the plugin's. Currently only X-Grafana-Id
+// qualifies; all other headers may carry a token that was issued by an
+// upstream IdP and cached by Grafana beyond its `exp`.
+func isTrustedGrafanaHeader(headerName string) bool {
+	return headerName == defaultJWTHeaderName
+}
+
+// jwtIsExpired returns (true, nil) when the token's `exp` claim is in the
+// past (with a 60s leeway). It returns (false, nil) when the claim is absent
+// (RFC 7519 makes `exp` optional). A malformed `exp` yields an error so the
+// caller can log it — treating a broken exp as "not expired" would defeat
+// the freshness check.
+func jwtIsExpired(claims jwt.MapClaims) (bool, error) {
+	raw, ok := claims["exp"]
+	if !ok {
+		return false, nil
+	}
+	var expUnix int64
+	switch v := raw.(type) {
+	case float64:
+		expUnix = int64(v)
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil {
+			return false, fmt.Errorf("exp is not an integer: %w", err)
+		}
+		expUnix = n
+	default:
+		return false, fmt.Errorf("exp has unsupported type %T", raw)
+	}
+	const leeway = 60 * time.Second
+	return time.Now().Add(-leeway).After(time.Unix(expUnix, 0)), nil
 }
 
 // categoriseJWTError maps a jwt parse/verify error to a short descriptive reason.

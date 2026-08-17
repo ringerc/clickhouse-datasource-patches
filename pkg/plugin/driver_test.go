@@ -917,14 +917,14 @@ func TestBuildEnforcedChSettings(t *testing.T) {
 		got := buildEnforcedStaticChSettings(s)
 		require.NotNil(t, got)
 		assert.Equal(t, clickhouse.CustomSetting{Value: "t1"}, got["custom_tenant"])
-		assert.Equal(t, uint8(1), got["readonly"])
+		assert.Equal(t, int(1), got["readonly"])
 	})
 
 	t.Run("EnforceReadOnly only (no custom enforced) includes readonly=1", func(t *testing.T) {
 		s := Settings{EnforceReadOnly: true}
 		got := buildEnforcedStaticChSettings(s)
 		require.NotNil(t, got)
-		assert.Equal(t, uint8(1), got["readonly"])
+		assert.Equal(t, int(1), got["readonly"])
 		assert.Len(t, got, 1)
 	})
 
@@ -961,7 +961,7 @@ func TestEnforcedSettingsContextAttachment(t *testing.T) {
 		got := enforcedSettingsFromContext(newCtx)
 		require.NotNil(t, got)
 		assert.Equal(t, clickhouse.CustomSetting{Value: "t1"}, got["custom_tenant"])
-		assert.Equal(t, uint8(1), got["readonly"])
+		assert.Equal(t, int(1), got["readonly"])
 	})
 
 	t.Run("no enforced settings leaves context clean", func(t *testing.T) {
@@ -974,16 +974,19 @@ func TestEnforcedSettingsContextAttachment(t *testing.T) {
 func TestMutateQueryError_ReadOnly(t *testing.T) {
 	ex164 := &clickhouse.Exception{Code: 164, Message: "cannot execute query in readonly mode"}
 
-	t.Run("code 164 with EnforceReadOnly=true returns friendly DownstreamError", func(t *testing.T) {
+	t.Run("code 164 with EnforceReadOnly=true is annotated with a hint and preserves the original", func(t *testing.T) {
 		h := &Clickhouse{enforceReadOnly: true}
 		result := h.MutateQueryError(ex164)
 
 		assert.True(t, backend.IsDownstreamError(result))
-		assert.Contains(t, result.Error(), "query rejected")
-		assert.Contains(t, result.Error(), "readonly=1")
+		// The original ClickHouse error text is preserved verbatim so operators
+		// see the real cause first.
 		assert.Contains(t, result.Error(), ex164.Error())
+		// The enforcement context is framed as a hint, not as the primary message.
+		assert.Contains(t, result.Error(), "hint:")
+		assert.Contains(t, result.Error(), "readonly=1")
 
-		// original exception still accessible in chain
+		// The original exception is still accessible via errors.As.
 		var got *clickhouse.Exception
 		assert.True(t, errors.As(result, &got))
 		assert.Equal(t, int32(164), got.Code)
@@ -1013,13 +1016,14 @@ func TestMutateQueryError_ReadOnly(t *testing.T) {
 		assert.False(t, backend.IsDownstreamError(result))
 	})
 
-	t.Run("wrapped 164 exception with EnforceReadOnly=true is rewritten", func(t *testing.T) {
+	t.Run("wrapped 164 exception with EnforceReadOnly=true is annotated and preserved", func(t *testing.T) {
 		h := &Clickhouse{enforceReadOnly: true}
 		wrapped := fmt.Errorf("query failed: %w", ex164)
 		result := h.MutateQueryError(wrapped)
 
 		assert.True(t, backend.IsDownstreamError(result))
-		assert.Contains(t, result.Error(), "query rejected")
+		assert.Contains(t, result.Error(), "hint:")
+		assert.Contains(t, result.Error(), ex164.Error())
 	})
 }
 
@@ -1084,7 +1088,7 @@ func TestHeaderBinding_HeaderPresent(t *testing.T) {
 	assert.True(t, exists, "custom_visible_tenants should be present in resolved map")
 	assert.Equal(t, clickhouse.CustomSetting{Value: "proj_a,proj_b"}, val)
 	// readonly=1 is also present
-	assert.Equal(t, uint8(1), got["readonly"])
+	assert.Equal(t, int(1), got["readonly"])
 }
 
 func TestHeaderBinding_HeaderMissing_Reject(t *testing.T) {
@@ -1159,7 +1163,7 @@ func TestHeaderBinding_StaticAndHeaderTogether(t *testing.T) {
 	require.NotNil(t, got)
 	assert.Equal(t, clickhouse.CustomSetting{Value: "t1"}, got["custom_tenant"])
 	assert.Equal(t, clickhouse.CustomSetting{Value: "alpha"}, got["custom_project"])
-	assert.Equal(t, uint8(1), got["readonly"])
+	assert.Equal(t, int(1), got["readonly"])
 }
 
 func TestHeaderBinding_CannotOverwriteReadonly(t *testing.T) {
@@ -1187,12 +1191,13 @@ func TestHeaderBinding_CannotOverwriteReadonly(t *testing.T) {
 	resolved, resolveErr := h.resolveEnforcedSettings(ctx)
 	require.NoError(t, resolveErr)
 	// The dynamic binding should have been skipped for "readonly".
-	assert.Equal(t, uint8(1), resolved["readonly"], "readonly must not be overwritten by dynamic binding")
+	assert.Equal(t, int(1), resolved["readonly"], "readonly must not be overwritten by dynamic binding")
 }
 
 func TestHeaderBinding_FastPath_NoDynamicBindings(t *testing.T) {
-	// When hasDynamicBindings is false, resolveEnforcedSettings should return
-	// exactly h.enforcedStatic (same map identity).
+	// When hasDynamicBindings is false, resolveEnforcedSettings must still
+	// return a fresh copy so callers cannot mutate the shared per-instance
+	// snapshot in h.enforcedStatic.
 	s := Settings{
 		CustomSettings:  []CustomSetting{{Setting: "custom_tenant", Value: "t1", Enforced: true}},
 		EnforceReadOnly: true,
@@ -1209,12 +1214,17 @@ func TestHeaderBinding_FastPath_NoDynamicBindings(t *testing.T) {
 	got := enforcedSettingsFromContext(ctx)
 	require.NotNil(t, got)
 	assert.Equal(t, clickhouse.CustomSetting{Value: "t1"}, got["custom_tenant"])
-	assert.Equal(t, uint8(1), got["readonly"])
+	assert.Equal(t, int(1), got["readonly"])
 
-	// resolveEnforcedSettings directly: returns same map (no copy).
+	// resolveEnforcedSettings direct call: returns an equal-value but
+	// independently-allocated map, so mutating the result does NOT corrupt
+	// h.enforcedStatic for the next request.
 	resolved, err := h.resolveEnforcedSettings(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, static, resolved)
+	resolved["custom_tenant"] = clickhouse.CustomSetting{Value: "mutated"}
+	assert.Equal(t, clickhouse.CustomSetting{Value: "t1"}, static["custom_tenant"],
+		"h.enforcedStatic must not be affected by mutations to a resolved map")
 }
 
 func TestInterpolateMacros_RejectError(t *testing.T) {
@@ -1228,6 +1238,32 @@ func TestInterpolateMacros_RejectError(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, backend.IsDownstreamError(err))
 	assert.Contains(t, err.Error(), "custom_x")
+}
+
+func TestMutateQuery_ShortCircuitOnResolutionError(t *testing.T) {
+	// When MutateQueryData stored a binding-resolution error, MutateQuery must
+	// short-circuit: no enforced settings should be attached to ctx and no
+	// clickhouse.WithSettings call should have run (the query is about to be
+	// rejected by interpolateMacros anyway).
+	s := Settings{
+		CustomSettings:  []CustomSetting{{Setting: "custom_tenant", Value: "t1", Enforced: true}},
+		EnforceReadOnly: true,
+	}
+	h := &Clickhouse{
+		enforceReadOnly:    true,
+		enforcedStatic:     buildEnforcedStaticChSettings(s),
+		hasDynamicBindings: true, // simulate presence of a dynamic binding
+	}
+
+	sentinelErr := backend.DownstreamError(fmt.Errorf("required header X-Tenant absent"))
+	ctx := context.WithValue(t.Context(), resolvedEnforcedErrCtxKey, sentinelErr)
+
+	outCtx, _ := h.MutateQuery(ctx, backend.DataQuery{JSON: []byte(`{}`)})
+	assert.Nil(t, enforcedSettingsFromContext(outCtx),
+		"enforced settings must not be attached when a resolution error is pending")
+	// The pending error is still accessible for interpolateMacros to surface.
+	got, _ := outCtx.Value(resolvedEnforcedErrCtxKey).(error)
+	assert.Equal(t, sentinelErr, got)
 }
 
 // ---------------------------------------------------------------------------
@@ -1282,7 +1318,7 @@ func TestJWTBinding_TokenPresent(t *testing.T) {
 	val, exists := got["custom_tenant"]
 	assert.True(t, exists)
 	assert.Equal(t, clickhouse.CustomSetting{Value: "proj_a,proj_b"}, val)
-	assert.Equal(t, uint8(1), got["readonly"])
+	assert.Equal(t, int(1), got["readonly"])
 }
 
 func TestJWTBinding_TokenMissing_Reject(t *testing.T) {
@@ -1344,8 +1380,93 @@ func TestJWTBinding_CannotOverwriteReadonly(t *testing.T) {
 
 	resolved, resolveErr := h.resolveEnforcedSettings(ctx)
 	require.NoError(t, resolveErr)
-	assert.Equal(t, uint8(1), resolved["readonly"], "readonly must not be overwritten by JWT binding")
+	assert.Equal(t, int(1), resolved["readonly"], "readonly must not be overwritten by JWT binding")
 }
 
 // jwtClaims is a type alias for test readability.
 type jwtClaims = map[string]interface{}
+
+func TestExtractForwardedHeadersFromMessage_Hardening(t *testing.T) {
+	t.Run("non-string element in array returns error", func(t *testing.T) {
+		message := json.RawMessage(`{
+			"grafana-http-headers": {
+				"X-Test": [123]
+			}
+		}`)
+		headers, err := extractForwardedHeadersFromMessage(message)
+		assert.Error(t, err)
+		assert.Nil(t, headers)
+		assert.Contains(t, err.Error(), "couldn't parse header X-Test: element 0 is not a string")
+	})
+
+	t.Run("multi-valued array header is dropped", func(t *testing.T) {
+		message := json.RawMessage(`{
+			"grafana-http-headers": {
+				"X-Test": ["a", "b"],
+				"X-Single": ["value"]
+			}
+		}`)
+		headers, err := extractForwardedHeadersFromMessage(message)
+		assert.NoError(t, err)
+		// Multi-valued header should be dropped
+		assert.NotContains(t, headers, "X-Test")
+		// Single-valued header should be present
+		assert.Equal(t, "value", headers["X-Single"])
+	})
+
+	t.Run("single-element array works without comma-joining", func(t *testing.T) {
+		message := json.RawMessage(`{
+			"grafana-http-headers": {
+				"X-Test": ["hello,world"]
+			}
+		}`)
+		headers, err := extractForwardedHeadersFromMessage(message)
+		assert.NoError(t, err)
+		// Should contain the literal string, not comma-joined
+		assert.Equal(t, "hello,world", headers["X-Test"])
+	})
+
+	t.Run("empty array is skipped", func(t *testing.T) {
+		message := json.RawMessage(`{
+			"grafana-http-headers": {
+				"X-Empty": [],
+				"X-Single": ["value"]
+			}
+		}`)
+		headers, err := extractForwardedHeadersFromMessage(message)
+		assert.NoError(t, err)
+		assert.NotContains(t, headers, "X-Empty")
+		assert.Equal(t, "value", headers["X-Single"])
+	})
+}
+
+func TestMutateQueryData_MultiValuedHeaderRejection(t *testing.T) {
+	t.Run("multi-valued header is dropped from forwarded headers", func(t *testing.T) {
+		h := &Clickhouse{}
+		req := &backend.QueryDataRequest{
+			Headers: map[string]string{
+				"http_X-Multi-Value": "a,b",
+				"http_X-Single":      "value",
+			},
+		}
+
+		ctx, _ := h.MutateQueryData(t.Context(), req)
+		fwdHeaders := forwardedHeadersFromContext(ctx)
+
+		// Single-valued header should be present
+		assert.Equal(t, "value", fwdHeaders["X-Single"])
+	})
+
+	t.Run("empty header values are skipped", func(t *testing.T) {
+		h := &Clickhouse{}
+		req := &backend.QueryDataRequest{
+			Headers: map[string]string{
+				"http_X-Valid": "value",
+			},
+		}
+
+		ctx, _ := h.MutateQueryData(t.Context(), req)
+		fwdHeaders := forwardedHeadersFromContext(ctx)
+		assert.Equal(t, "value", fwdHeaders["X-Valid"])
+	})
+}

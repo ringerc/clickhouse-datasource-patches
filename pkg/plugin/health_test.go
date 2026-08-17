@@ -408,9 +408,12 @@ func TestMakeEnforcedSettingsHealthCheck_JWTVerifyNone_InfoMessage(t *testing.T)
 
 func TestMakeEnforcedSettingsHealthCheck_JWTVerifyJWKS_ReachableURL_InfoMessage(t *testing.T) {
 	// verify=jwks with a reachable server → info message confirming reachability.
+	// Serve a JWKS with one RSA key so the probe's non-empty check passes.
+	// (The keyfunc-based probe intentionally rejects `{"keys":[]}` because
+	// such a document would fail every real verification.)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintln(w, `{"keys":[]}`)
+		fmt.Fprintln(w, `{"keys":[{"kty":"RSA","kid":"probe","use":"sig","alg":"RS256","n":"sXchDaQebHnPiGvyDOAT4saGEUetSyo9MKLOoWFsueri23bOdgWp4Dy1WlUzewbgBHod5pcM9H95GQRV3JDXboIRROSBigeC5yjU1hGzHHyXss8UDprecbAYxknTcQkhslANGRUZmdTOQ5ZTsUp7hIu6UMULhg9AzUcQq6vNoVc","e":"AQAB"}]}`)
 	}))
 	defer srv.Close()
 
@@ -458,4 +461,150 @@ func TestMakeEnforcedSettingsHealthCheck_JWTVerifyJWKS_UnreachableURL_ErrorStatu
 	defer cancel()
 	err := probeJWKSURL(probeCtx, unreachableURL)
 	assert.Error(t, err, "probeJWKSURL should fail for an unreachable URL")
+}
+
+// ---------------------------------------------------------------------------
+// checkForwardHeadersGate (item 11c)
+// ---------------------------------------------------------------------------
+
+func TestHeaderIsAlwaysForwarded(t *testing.T) {
+	// Every canonical form of an always-forwarded header must be recognised.
+	// These are Grafana core middleware headers that reach the plugin regardless
+	// of the datasource "Forward Grafana HTTP Headers" toggle.
+	for _, h := range []string{
+		"X-Grafana-Id",
+		"X-Dashboard-Uid",
+		"X-Panel-Id",
+		"X-Rule-Uid",
+		"X-Datasource-Uid",
+	} {
+		assert.True(t, headerIsAlwaysForwarded(http.CanonicalHeaderKey(h)),
+			"%q should be treated as always-forwarded", h)
+	}
+	// Toggle-gated headers must NOT be included; a binding on them requires
+	// the forwardGrafanaHeaders toggle.
+	for _, h := range []string{
+		"Authorization",
+		"X-Id-Token",
+		"Cookie",
+		"X-Grafana-User",
+		"X-Tenant",
+		"Cf-Access-Jwt-Assertion",
+	} {
+		assert.False(t, headerIsAlwaysForwarded(http.CanonicalHeaderKey(h)),
+			"%q must require the forwardGrafanaHeaders toggle", h)
+	}
+}
+
+func TestCheckForwardHeadersGate_ToggleOn_NeverFails(t *testing.T) {
+	s := Settings{
+		EnforceReadOnly:       true,
+		ForwardGrafanaHeaders: true,
+		CustomSettings: []CustomSetting{
+			{Setting: "custom_x", Enforced: true, Source: customSettingSourceHeader, HeaderName: "X-Tenant", OnMissing: onMissingReject},
+		},
+	}
+	assert.Nil(t, checkForwardHeadersGate(s))
+}
+
+func TestCheckForwardHeadersGate_ToggleOff_AlwaysForwarded_Passes(t *testing.T) {
+	// Header binding on X-Grafana-Id (always-forwarded) → no gate error even with toggle off.
+	s := Settings{
+		EnforceReadOnly: true,
+		CustomSettings: []CustomSetting{
+			{Setting: "custom_x", Enforced: true, Source: customSettingSourceHeader, HeaderName: "X-Grafana-Id", OnMissing: onMissingReject},
+		},
+	}
+	assert.Nil(t, checkForwardHeadersGate(s))
+}
+
+func TestCheckForwardHeadersGate_ToggleOff_CustomHeader_Fails(t *testing.T) {
+	s := Settings{
+		EnforceReadOnly: true,
+		CustomSettings: []CustomSetting{
+			{Setting: "custom_x", Enforced: true, Source: customSettingSourceHeader, HeaderName: "X-Tenant", OnMissing: onMissingReject},
+		},
+	}
+	result := checkForwardHeadersGate(s)
+	require.NotNil(t, result)
+	assert.Equal(t, backend.HealthStatusError, result.Status)
+	assert.Contains(t, result.Message, "custom_x")
+	assert.Contains(t, result.Message, "X-Tenant")
+	assert.Contains(t, result.Message, "Forward Grafana HTTP Headers")
+}
+
+func TestCheckForwardHeadersGate_ToggleOff_JWTOnCustomHeader_Fails(t *testing.T) {
+	s := Settings{
+		EnforceReadOnly: true,
+		CustomSettings: []CustomSetting{
+			{
+				Setting:       "custom_x",
+				Enforced:      true,
+				Source:        CustomSettingSourceJWT,
+				JWTHeaderName: "X-Id-Token",
+				JWTClaim:      "tenants",
+				JWTVerify:     CustomSettingJWTVerifyNone,
+				OnMissing:     onMissingReject,
+			},
+		},
+	}
+	result := checkForwardHeadersGate(s)
+	require.NotNil(t, result)
+	assert.Equal(t, backend.HealthStatusError, result.Status)
+	assert.Contains(t, result.Message, "X-Id-Token")
+}
+
+func TestCheckForwardHeadersGate_ToggleOff_JWTOnXGrafanaId_Passes(t *testing.T) {
+	// JWT source with the default X-Grafana-Id header does not need the toggle.
+	s := Settings{
+		EnforceReadOnly: true,
+		CustomSettings: []CustomSetting{
+			{
+				Setting:       "custom_x",
+				Enforced:      true,
+				Source:        CustomSettingSourceJWT,
+				JWTHeaderName: "X-Grafana-Id",
+				JWTClaim:      "tenants",
+				JWTVerify:     CustomSettingJWTVerifyNone,
+				OnMissing:     onMissingReject,
+			},
+		},
+	}
+	assert.Nil(t, checkForwardHeadersGate(s))
+}
+
+// ---------------------------------------------------------------------------
+// probeJWKSURL (item 14a) — keyfunc-based probe
+// ---------------------------------------------------------------------------
+
+func TestProbeJWKSURL_EmptyKeySet_Rejected(t *testing.T) {
+	// A JWKS URL that returns `{"keys":[]}` parses successfully but would
+	// fail every verification. The probe must reject it so operators find
+	// out at "Save & Test" time.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"keys":[]}`)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := probeJWKSURL(ctx, srv.URL)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no keys")
+}
+
+func TestProbeJWKSURL_MalformedJSON_Rejected(t *testing.T) {
+	// A JWKS URL returning HTTP 200 but non-JSON content must fail — the
+	// old naive GET would have accepted it.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintln(w, "<html>not a JWKS document</html>")
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := probeJWKSURL(ctx, srv.URL)
+	require.Error(t, err)
 }

@@ -236,10 +236,14 @@ func TestJWTValueSource_BearerPrefix(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// jwtValueSource.Resolve — malformed token returns error (not missing)
+// jwtValueSource.Resolve — malformed token semantics
 // ---------------------------------------------------------------------------
 
-func TestJWTValueSource_MalformedToken(t *testing.T) {
+// Under verify=none a malformed token is treated as "value absent" so the
+// OnMissing policy on the binding decides the outcome. This lets operators
+// configure OnMissing=empty on best-effort paths (e.g. alerting) without
+// having their queries hard-fail on a corrupted forwarded token.
+func TestJWTValueSource_MalformedToken_VerifyNone_TreatedAsAbsent(t *testing.T) {
 	src := &jwtValueSource{
 		settingName: "tenant",
 		headerName:  "X-Grafana-Id",
@@ -249,10 +253,10 @@ func TestJWTValueSource_MalformedToken(t *testing.T) {
 	}
 
 	ctx := jwtCtx("X-Grafana-Id", "this.is.not.a.valid.jwt")
-	_, ok, err := src.Resolve(ctx)
-	assert.Error(t, err, "malformed JWT should return an error, not ok=false")
-	assert.False(t, ok)
-	assert.Contains(t, err.Error(), "malformed")
+	val, ok, err := src.Resolve(ctx)
+	assert.NoError(t, err, "malformed JWT under verify=none must NOT hard-fail; OnMissing decides")
+	assert.False(t, ok, "malformed JWT under verify=none must report ok=false so OnMissing applies")
+	assert.Empty(t, val)
 }
 
 // ---------------------------------------------------------------------------
@@ -454,4 +458,109 @@ func TestJWTValueSource_JWKSNilCacheReturnsError(t *testing.T) {
 	assert.Error(t, err)
 	assert.False(t, ok)
 	assert.Contains(t, err.Error(), "JWKS")
+}
+
+// ---------------------------------------------------------------------------
+// verify=none: exp enforcement for non-X-Grafana-Id headers
+// ---------------------------------------------------------------------------
+
+// Under verify=none the plugin still enforces `exp` when the token is
+// forwarded via a header other than X-Grafana-Id. Grafana validates upstream
+// OAuth tokens only at login and forwards them from cache; a stale claim
+// binding to a server-side setting is worse than an absent one, so an
+// expired token is treated as "absent" and OnMissing decides.
+func TestJWTValueSource_VerifyNone_ExpEnforced_ForNonGrafanaHeader(t *testing.T) {
+	// Build a syntactically valid but expired token.
+	expired := makeTestJWT(t, jwt.MapClaims{
+		"tenants": "t1,t2",
+		"exp":     float64(time.Now().Add(-1 * time.Hour).Unix()),
+	})
+
+	src := &jwtValueSource{
+		settingName: "tenant",
+		headerName:  "X-Id-Token", // not X-Grafana-Id → freshness must be enforced
+		claimPath:   []string{"tenants"},
+		joinSep:     ",",
+		verify:      CustomSettingJWTVerifyNone,
+	}
+
+	ctx := jwtCtx("X-Id-Token", expired)
+	val, ok, err := src.Resolve(ctx)
+	assert.NoError(t, err, "expired JWT under verify=none must NOT hard-fail; OnMissing decides")
+	assert.False(t, ok, "expired JWT under verify=none must report ok=false so OnMissing applies")
+	assert.Empty(t, val)
+}
+
+// The X-Grafana-Id header is trusted: Grafana re-mints it per request, so
+// the plugin does NOT enforce `exp` there under verify=none. This matches
+// the documented trust model and avoids false negatives when the plugin's
+// clock is skewed relative to Grafana's mint time.
+func TestJWTValueSource_VerifyNone_ExpNotEnforced_ForXGrafanaId(t *testing.T) {
+	// Build a token whose exp has "passed" but with X-Grafana-Id header.
+	// It must be treated as present.
+	expired := makeTestJWT(t, jwt.MapClaims{
+		"tenants": "t1,t2",
+		"exp":     float64(time.Now().Add(-1 * time.Hour).Unix()),
+	})
+
+	src := &jwtValueSource{
+		settingName: "tenant",
+		headerName:  "X-Grafana-Id",
+		claimPath:   []string{"tenants"},
+		joinSep:     ",",
+		verify:      CustomSettingJWTVerifyNone,
+	}
+
+	ctx := jwtCtx("X-Grafana-Id", expired)
+	val, ok, err := src.Resolve(ctx)
+	assert.NoError(t, err)
+	assert.True(t, ok, "X-Grafana-Id is trusted; exp not enforced under verify=none")
+	assert.Equal(t, "t1,t2", val)
+}
+
+// A token whose exp is within the leeway window (60 s in the past) is
+// still considered fresh.
+func TestJWTValueSource_VerifyNone_ExpLeeway(t *testing.T) {
+	tok := makeTestJWT(t, jwt.MapClaims{
+		"tenants": "t1",
+		"exp":     float64(time.Now().Add(-30 * time.Second).Unix()), // within 60s leeway
+	})
+
+	src := &jwtValueSource{
+		settingName: "tenant",
+		headerName:  "X-Id-Token",
+		claimPath:   []string{"tenants"},
+		joinSep:     ",",
+		verify:      CustomSettingJWTVerifyNone,
+	}
+
+	ctx := jwtCtx("X-Id-Token", tok)
+	val, ok, err := src.Resolve(ctx)
+	assert.NoError(t, err)
+	assert.True(t, ok, "exp within 60s leeway must be accepted")
+	assert.Equal(t, "t1", val)
+}
+
+// A token with no exp claim under verify=none from a non-trusted header is
+// still accepted (RFC 7519 makes exp optional). Operators who require exp
+// should use verify=jwks with jwt.WithExpirationRequired at parse time.
+func TestJWTValueSource_VerifyNone_MissingExp_Accepted(t *testing.T) {
+	tok := makeTestJWT(t, jwt.MapClaims{
+		"tenants": "t1",
+		// no exp
+	})
+
+	src := &jwtValueSource{
+		settingName: "tenant",
+		headerName:  "X-Id-Token",
+		claimPath:   []string{"tenants"},
+		joinSep:     ",",
+		verify:      CustomSettingJWTVerifyNone,
+	}
+
+	ctx := jwtCtx("X-Id-Token", tok)
+	val, ok, err := src.Resolve(ctx)
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "t1", val)
 }

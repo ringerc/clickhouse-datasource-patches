@@ -72,9 +72,14 @@ type Clickhouse struct {
 
 // buildEnforcedStaticChSettings constructs the clickhouse.Settings map that must be
 // injected on every query when enforced settings or readonly=1 are configured.
-// Returns nil when neither applies. Never mutate the returned map.
+// Returns nil when neither applies.
+//
+// This map is a per-instance snapshot. resolveEnforcedSettings always copies
+// it before handing it out, so the returned reference on this instance is
+// never exposed to callers that could mutate it.
+//
 // Only static-source enforced settings are included; dynamic-source entries
-// (e.g. "header") are resolved per-query in commit 2.
+// (e.g. "header") are resolved per-query in resolveEnforcedSettings.
 func buildEnforcedStaticChSettings(s Settings) clickhouse.Settings {
 	m := s.enforcedSettings()
 	if !s.shouldForceReadOnly() && len(m) == 0 {
@@ -85,7 +90,11 @@ func buildEnforcedStaticChSettings(s Settings) clickhouse.Settings {
 		cs[k] = v
 	}
 	if s.shouldForceReadOnly() {
-		cs["readonly"] = uint8(1)
+		// clickhouse-go accepts a plain integer here and serialises correctly
+		// on both HTTP and Native protocols. Prefer int(1) over uint8(1) so
+		// the value type matches other integer-valued settings and cannot
+		// surprise a future clickhouse-go release that tightens type checks.
+		cs["readonly"] = int(1)
 	}
 	return cs
 }
@@ -101,10 +110,22 @@ func enforcedSettingsFromContext(ctx context.Context) clickhouse.Settings {
 // current request. Static bindings are copied from h.enforcedStatic; dynamic
 // bindings are resolved from ctx. Returns a downstream error when an
 // OnMissing="reject" binding cannot be satisfied.
+//
+// The returned map is always a fresh allocation; callers may not mutate
+// h.enforcedStatic through it.
 func (h *Clickhouse) resolveEnforcedSettings(ctx context.Context) (clickhouse.Settings, error) {
-	// Fast path: nothing dynamic to resolve.
+	// Fast path: no dynamic bindings. Still allocate a fresh copy so callers
+	// (and clickhouse-go's WithSettings) cannot mutate the shared per-instance
+	// snapshot.
 	if !h.hasDynamicBindings {
-		return h.enforcedStatic, nil
+		if len(h.enforcedStatic) == 0 {
+			return nil, nil
+		}
+		out := make(clickhouse.Settings, len(h.enforcedStatic))
+		for k, v := range h.enforcedStatic {
+			out[k] = v
+		}
+		return out, nil
 	}
 	out := make(clickhouse.Settings, len(h.enforcedStatic)+len(h.enforcedBindings))
 	for k, v := range h.enforcedStatic {
@@ -135,7 +156,7 @@ func (h *Clickhouse) resolveEnforcedSettings(ctx context.Context) (clickhouse.Se
 		if strings.EqualFold(b.Setting, "readonly") {
 			continue
 		}
-		backend.Logger.Info("resolved enforced setting", "setting", b.Setting, "source", b.Source.Kind())
+		backend.Logger.Debug("resolved enforced setting", "setting", b.Setting, "source", b.Source.Kind())
 		out[b.Setting] = wrapCustomSettingValue(b.Setting, val)
 	}
 	return out, nil
@@ -471,16 +492,21 @@ func (h *Clickhouse) Macros() sqlds.Macros {
 }
 
 // MutateQueryError marks ClickHouse errors as downstream errors.
-// When EnforceReadOnly is active, READONLY errors (code 164) are rewritten
-// with a friendlier message explaining that readonly=1 is enforced.
+// When EnforceReadOnly is active, READONLY errors (code 164) are annotated
+// with a hint explaining that this datasource injects readonly=1 on every
+// query — the original ClickHouse error is preserved verbatim (both in the
+// message and in the error chain) so operators can distinguish an
+// enforcement collision from an unrelated readonly failure.
 func (h *Clickhouse) MutateQueryError(err error) backend.ErrorWithSource {
 	var ex *clickhouse.Exception
 	if errors.As(err, &ex) && ex.Code == 164 && h.enforceReadOnly {
-		friendly := fmt.Sprintf(
-			"query rejected: this datasource enforces server-side ClickHouse settings and runs queries under readonly=1; "+
-				"SET/SETTINGS clauses that change server settings are not allowed. Original error: %s", err)
-		combined := errors.Join(errors.New(friendly), err)
-		return backend.NewErrorWithSource(combined, backend.ErrorSourceDownstream)
+		// Preserve the original ClickHouse error via %w so error unwrapping
+		// (errors.As, errors.Is) continues to work. Frame the enforcement
+		// context as a hint rather than as the primary message, so that a
+		// user reading the error sees the real cause first.
+		hint := "hint: this datasource injects readonly=1 on every query; SET or SETTINGS clauses that change server settings will be rejected. If your query does not set any server settings, the target setting may be marked non-CHANGEABLE_IN_READONLY on the server."
+		wrapped := fmt.Errorf("%w (%s)", err, hint)
+		return backend.NewErrorWithSource(wrapped, backend.ErrorSourceDownstream)
 	}
 	// Check if any error in the error chain (including multi-errors) is a clickhouse.Exception
 	if containsClickHouseException(err) {
@@ -586,7 +612,15 @@ func (h *Clickhouse) MutateQueryData(
 	for k, vv := range httpHeaders {
 		ck := http.CanonicalHeaderKey(k)
 		if _, exists := canon[ck]; !exists {
-			canon[ck] = strings.Join(vv, ",")
+			if len(vv) == 0 {
+				continue
+			}
+			if len(vv) > 1 {
+				backend.Logger.Warn("dropping multi-valued forwarded header; configure your proxy to send a single value",
+					"header", ck, "value_count", len(vv))
+				continue
+			}
+			canon[ck] = vv[0]
 		}
 	}
 	ctx = WithForwardedHeaders(ctx, canon)
@@ -729,6 +763,17 @@ func (h *Clickhouse) MutateQuery(ctx context.Context, req backend.DataQuery) (co
 
 	defer span.End()
 
+	// If MutateQueryData already stored a binding-resolution error in ctx
+	// (e.g. required header/JWT absent, JWKS verification failed), skip the
+	// rest of the pipeline: interpolateMacros will surface that error and the
+	// query never reaches the database. Doing extra work here (span
+	// attributes, query-comment building, timezone parsing) is wasted and
+	// would only pollute traces for a query that's about to be rejected.
+	if _, hasErr := ctx.Value(resolvedEnforcedErrCtxKey).(error); hasErr {
+		span.SetAttributes(attribute.Bool("clickhouse.enforced_settings.rejected", true))
+		return ctx, req
+	}
+
 	// Prefer the per-request resolved settings (attached in MutateQueryData).
 	// Falls back to h.enforcedStatic when MutateQueryData did not run — unit
 	// tests instantiate Clickhouse directly without going through the sqlds
@@ -736,7 +781,7 @@ func (h *Clickhouse) MutateQuery(ctx context.Context, req backend.DataQuery) (co
 	var resolved clickhouse.Settings
 	if v, ok := ctx.Value(resolvedEnforcedCtxKey).(clickhouse.Settings); ok {
 		resolved = v
-	} else if _, hasErr := ctx.Value(resolvedEnforcedErrCtxKey).(error); !hasErr && !h.hasDynamicBindings {
+	} else if !h.hasDynamicBindings {
 		resolved = h.enforcedStatic
 	}
 
@@ -776,7 +821,6 @@ func (h *Clickhouse) MutateQuery(ctx context.Context, req backend.DataQuery) (co
 			attribute.Int("clickhouse.enforced_settings.header_sourced.resolved", headerResolved),
 			attribute.Int("clickhouse.enforced_settings.jwt_sourced.count", jwtCount),
 			attribute.Int("clickhouse.enforced_settings.jwt_sourced.resolved", jwtResolved),
-			attribute.Int("clickhouse.enforced_settings.jwt_sourced.verify_failures", 0),
 		)
 	}
 
@@ -950,12 +994,25 @@ func extractForwardedHeadersFromMessage(message json.RawMessage) (map[string]str
 				return nil, fmt.Errorf("couldn't parse header %s as an array", k)
 			}
 
-			strHeadersArr := make([]string, len(anyHeadersArr))
-			for ind, val := range anyHeadersArr {
-				strHeadersArr[ind] = val.(string)
+			if len(anyHeadersArr) == 0 {
+				continue
 			}
 
-			httpHeaders[k] = strings.Join(strHeadersArr, ",")
+			// Check for multi-valued headers and reject them
+			if len(anyHeadersArr) > 1 {
+				ck := http.CanonicalHeaderKey(k)
+				backend.Logger.Warn("dropping multi-valued forwarded header; configure your proxy to send a single value",
+					"header", ck, "value_count", len(anyHeadersArr))
+				continue
+			}
+
+			// Validate the single element is a string
+			val, ok := anyHeadersArr[0].(string)
+			if !ok {
+				return nil, fmt.Errorf("couldn't parse header %s: element 0 is not a string", k)
+			}
+
+			httpHeaders[k] = val
 		}
 	}
 
