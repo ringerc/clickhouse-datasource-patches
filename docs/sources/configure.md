@@ -539,7 +539,7 @@ When the toggle is on, the following headers are forwarded on each ClickHouse co
 ### Use cases
 
 - **Query-log attribution** — ClickHouse records the forwarded headers in `system.query_log.http_user_agent` and related fields, so operators can correlate queries back to the Grafana user and dashboard that triggered them.
-- **Row policies and quotas** — ClickHouse [row policies](https://clickhouse.com/docs/en/operations/access-rights/#row-policies) and [quotas](https://clickhouse.com/docs/en/operations/quotas) can key on the `X-Grafana-User` header, so a single shared ClickHouse account can still enforce per-viewer access rules.
+- **Row policies and quotas** — ClickHouse [row policies](https://clickhouse.com/docs/en/operations/access-rights/#row-policies) and [quotas](https://clickhouse.com/docs/en/operations/quotas) can key on the `X-Grafana-User` header, so a single shared ClickHouse account can still enforce per-viewer access rules. For a stronger, tamper-resistant, and more flexible mechanism — including per-request tenant claims sourced from a JWT or a signed proxy header, and settings the end user cannot override in their SQL — see [Enforcing server-side settings](#enforcing-server-side-settings).
 
 ### Connection pool implications
 
