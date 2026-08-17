@@ -207,7 +207,7 @@ When any custom setting is marked **Enforced**, the **Enforce read-only on all q
 The plugin injects the enforced settings and `readonly=1` as per-query settings out-of-band with the SQL — via HTTP query-string parameters or the Native protocol's per-query settings block. ClickHouse enforces two invariants that make this tamper-resistant:
 
 1. `readonly` can only be increased per query; a user's `SETTINGS readonly=0` is rejected once it is already `1`.
-2. Under `readonly=1`, any `SETTINGS foo=…` or `SET foo=…` in the user's SQL that attempts to change a non-whitelisted setting is rejected outright.
+2. Under `readonly=1`, any `SETTINGS foo=…` or `SET foo=…` in the user's SQL that attempts to change a non-allowlisted setting is rejected outright.
 
 **Caveats that apply to every enforced setting, regardless of value source:**
 
@@ -443,7 +443,7 @@ Header- and JWT-sourced bindings depend on Grafana forwarding the right HTTP hea
 | ---------------- | -------------------- | --------------------------------------------------------------------------------------------------------- |
 | `[feature_toggles]` | `idForwarding`    | Enables Grafana to mint and forward `X-Grafana-Id` to backend plugins. **Only affects the `X-Grafana-Id` header.** Not required when your binding consumes an external IdP's JWT (`X-Id-Token`, `Authorization`, or a custom header carrying an IdP token) — those flow via the datasource-level **Forward Grafana HTTP Headers** and/or **Forward OAuth Identity** toggles. Because `X-Grafana-Id` is sanitized to Grafana-native claims only, enabling `idForwarding` is rarely useful for tenant/group-style bindings; leave it off unless you specifically need to bind on `sub`/`namespace`/`authenticated_by`. |
 | `[dataproxy]`    | `send_user_header`   | Enables `X-Grafana-User` on requests routed through Grafana's dataproxy. Not required for this plugin, which injects `X-Grafana-User` itself when **Forward Grafana HTTP Headers** is on. |
-| `[dataproxy]`    | `allowed_headers`    | Whitelist of custom header names Grafana will forward through the dataproxy path. Applies to custom headers coming from upstream, not to browser-supplied headers via the plugin SDK path. |
+| `[dataproxy]`    | `allowed_headers`    | Allowlist of custom header names Grafana will forward through the dataproxy path. Applies to custom headers coming from upstream, not to browser-supplied headers via the plugin SDK path. |
 
 Refer to the [Grafana configuration docs](https://grafana.com/docs/grafana/latest/setup-grafana/configure-grafana/) for the full syntax of these options.
 

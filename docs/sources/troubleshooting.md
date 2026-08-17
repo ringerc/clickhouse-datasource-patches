@@ -277,7 +277,7 @@ Query rejected — enforced settings or read-only mode
 
 **Error message:** "query rejected: this datasource enforces server-side ClickHouse settings and runs queries under readonly=1; SET/SETTINGS clauses that change server settings are not allowed. Original error: [original ClickHouse error]"
 
-**Cause:** The data source is configured with one or more **Enforced** custom settings or with the **Enforce read-only on all queries** toggle enabled. ClickHouse returns error code 164 (READONLY) when the user's SQL contains a `SET` statement or a `SETTINGS` clause that attempts to modify a non-whitelisted setting.
+**Cause:** The data source is configured with one or more **Enforced** custom settings or with the **Enforce read-only on all queries** toggle enabled. ClickHouse returns error code 164 (READONLY) when the user's SQL contains a `SET` statement or a `SETTINGS` clause that attempts to modify a non-allowlisted setting.
 
 **Solution:** This is intentional behaviour. If a user legitimately needs to tune a specific setting per query (for example, `max_threads`), ask an operator to mark that setting as `CHANGEABLE_IN_READONLY` in the server-side settings profile for the Grafana user. Do **not** apply `CHANGEABLE_IN_READONLY` to any setting that is also marked **Enforced** in the data source, as that would allow users to override the enforced value.
 
