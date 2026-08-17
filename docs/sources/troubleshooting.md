@@ -747,7 +747,7 @@ query rejected: required value for enforced setting 'custom_visible_tenants' was
 
 **Common causes and remediation:**
 
-1. **Grafana is not forwarding the header to the backend plugin.** The header may be present in the browser request but stripped by Grafana before it reaches the datasource plugin. Check that the header name appears in Grafana's `allowed_headers` list, or that the **Forward Grafana HTTP Headers** toggle is enabled in the datasource configuration. See [Enabling Grafana header forwarding](configure.md#header-sourced-values) for details.
+1. **Grafana is not forwarding the header to the backend plugin.** The header may be present in the browser request but stripped by Grafana before it reaches the datasource plugin. Check that the header name appears in Grafana's `allowed_headers` list, or that the **Forward Grafana HTTP Headers** toggle is enabled in the datasource configuration. See [Grafana settings that affect enforced bindings](configure/#grafana-settings-that-affect-enforced-bindings) for details.
 
 2. **The upstream proxy is not setting the header.** Verify that the proxy unconditionally sets the header on every request and that it is doing so before the request reaches Grafana. Check the proxy access logs to confirm the header is present.
 
@@ -805,7 +805,7 @@ The sub-error indicates the specific failure. Common sub-errors and their remedi
 
 - **`aud claim mismatch`** — The token's `aud` claim does not contain the expected audience. Verify the `jwtAudience` value configured in the datasource.
 
-- **`JWKS endpoint unreachable`** — See [JWKS URL is unreachable](#health-check-fails--jwks-url-is-unreachable) below.
+- **`JWKS endpoint unreachable`** — See [JWKS URL is unreachable](#health-check-fails-jwks-url-is-unreachable) below.
 
 ---
 
