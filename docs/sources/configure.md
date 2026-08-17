@@ -411,7 +411,7 @@ jsonData:
 
 #### Grafana settings that affect enforced bindings
 
-Header- and JWT-sourced bindings depend on Grafana forwarding the right HTTP headers to the plugin. The relevant knobs live in three places: Grafana feature toggles, `grafana.ini`, and per-datasource toggles.
+Header- and JWT-sourced bindings depend on Grafana forwarding the right HTTP headers to the plugin. The relevant knobs live in two places: the `idForwarding` feature toggle in `grafana.ini` (see the `X-Grafana-Id` row in [Choosing the token header](#choosing-the-token-header)) and the per-datasource toggles listed below.
 
 **Which headers Grafana forwards to backend plugins:**
 
@@ -422,8 +422,8 @@ Header- and JWT-sourced bindings depend on Grafana forwarding the right HTTP hea
 | `Authorization`                                              | No                    | Datasource **Forward OAuth Identity** toggle, **or** datasource **Forward Grafana HTTP Headers** toggle. |
 | `X-Id-Token`                                                 | No                    | Datasource **Forward Grafana HTTP Headers** toggle.                                              |
 | `Cookie`                                                     | No                    | Datasource **Forward Grafana HTTP Headers** toggle.                                              |
-| `X-Grafana-User`                                             | No                    | Datasource **Forward Grafana HTTP Headers** toggle. This plugin injects `X-Grafana-User` from the plugin's request context when the toggle is on, so you do **not** need `send_user_header = true` in `grafana.ini` for this plugin specifically. |
-| Any custom header (e.g. `X-Allowed-Projects`, custom JWT header) | No                    | Datasource **Forward Grafana HTTP Headers** toggle. The header name must also be listed in Grafana's `[dataproxy] allowed_headers` if you route via the Grafana proxy. |
+| `X-Grafana-User`                                             | No                    | Datasource **Forward Grafana HTTP Headers** toggle. This plugin injects `X-Grafana-User` from the plugin's request context when the toggle is on. |
+| Any custom header (e.g. `X-Allowed-Projects`, custom JWT header) | No                    | Datasource **Forward Grafana HTTP Headers** toggle.                                              |
 
 **Datasource-level toggles that matter for enforced bindings:**
 
@@ -436,16 +436,6 @@ Header- and JWT-sourced bindings depend on Grafana forwarding the right HTTP hea
 {{< admonition type="warning" >}}
 **"Forward Grafana HTTP Headers" is required for most bindings.** If a `header`- or `jwt`-sourced enforced binding points at a header outside the always-forwarded set (`X-Grafana-Id`, `X-Dashboard-Uid`, `X-Panel-Id`, `X-Rule-Uid`, `X-Datasource-Uid`) and the toggle is off, the datasource's **Save & Test** health check fails with a clear error so the misconfiguration surfaces before end users hit it.
 {{< /admonition >}}
-
-**`grafana.ini` settings that can influence header-based bindings:**
-
-| Section          | Key                  | Effect                                                                                                    |
-| ---------------- | -------------------- | --------------------------------------------------------------------------------------------------------- |
-| `[feature_toggles]` | `idForwarding`    | Enables Grafana to mint and forward `X-Grafana-Id` to backend plugins. **Only affects the `X-Grafana-Id` header.** Not required when your binding consumes an external IdP's JWT (`X-Id-Token`, `Authorization`, or a custom header carrying an IdP token) — those flow via the datasource-level **Forward Grafana HTTP Headers** and/or **Forward OAuth Identity** toggles. Because `X-Grafana-Id` is sanitized to Grafana-native claims only, enabling `idForwarding` is rarely useful for tenant/group-style bindings; leave it off unless you specifically need to bind on `sub`/`namespace`/`authenticated_by`. |
-| `[dataproxy]`    | `send_user_header`   | Enables `X-Grafana-User` on requests routed through Grafana's dataproxy. Not required for this plugin, which injects `X-Grafana-User` itself when **Forward Grafana HTTP Headers** is on. |
-| `[dataproxy]`    | `allowed_headers`    | **Does not apply to this plugin.** `allowed_headers` gates Grafana's dataproxy HTTP-reverse-proxy path (`/api/datasources/proxy/…`), used by some frontend-only data sources. This plugin runs its own ClickHouse client via the backend-plugin SDK (`QueryData`), so the headers reaching an enforced binding are governed by the datasource-level **Forward Grafana HTTP Headers** and **Forward OAuth Identity** toggles above, plus `idForwarding` for `X-Grafana-Id`. Leave `allowed_headers` at its default unless you need it for another data source. |
-
-Refer to the [Grafana configuration docs](https://grafana.com/docs/grafana/latest/setup-grafana/configure-grafana/) for the full syntax of these options.
 
 #### Save & Test health checks
 
