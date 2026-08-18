@@ -220,7 +220,11 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
       jsonData: {
         ...options.jsonData,
         customSettings: customSettings.filter(
-          (s) => !!s.setting && (!!s.value || (s.enforced && s.source === 'header' && !!s.headerName) || (s.enforced && s.source === 'jwt' && !!s.jwtClaim))
+          (s) =>
+            !!s.setting &&
+            (!!s.value ||
+              (s.enforced && s.source === 'header' && !!s.headerName) ||
+              (s.enforced && s.source === 'jwt' && Array.isArray(s.jwtClaimPath) && s.jwtClaimPath.length > 0 && !!s.jwtClaimPath[0]))
         ),
       },
     });
@@ -980,7 +984,7 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
                   {labels.customSettings.jwtInfoBanner.message}
                 </Alert>
               )}
-              {customSettings.map(({ setting, value, enforced, source, headerName, onMissing, jwtHeaderName, jwtClaim, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience }, i) => {
+              {customSettings.map(({ setting, value, enforced, source, headerName, onMissing, jwtHeaderName, jwtClaimPath, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience }, i) => {
                 const effectiveSource: CHCustomSettingSource = source || 'static';
                 const isHeader = enforced && effectiveSource === 'header';
                 const isJWT = enforced && effectiveSource === 'jwt';
@@ -994,7 +998,7 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
                         placeholder={'Setting'}
                         onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
                           let newSettings = customSettings.concat();
-                          newSettings[i] = { setting: changeEvent.target.value, value, enforced, source, headerName, onMissing, jwtHeaderName, jwtClaim, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
+                          newSettings[i] = { setting: changeEvent.target.value, value, enforced, source, headerName, onMissing, jwtHeaderName, jwtClaimPath, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
                           setCustomSettings(newSettings);
                         }}
                         onBlur={() => {
@@ -1070,7 +1074,7 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
                               newSettings[i] = { setting, value: '', enforced, source: newSource, headerName, onMissing };
                             } else if (newSource === 'jwt') {
                               // switching to jwt: clear value and headerName
-                              newSettings[i] = { setting, value: '', enforced, source: newSource, onMissing, jwtHeaderName, jwtClaim, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
+                              newSettings[i] = { setting, value: '', enforced, source: newSource, onMissing, jwtHeaderName, jwtClaimPath, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
                             } else {
                               // switching to static: clear headerName, onMissing, and all jwt fields
                               newSettings[i] = { setting, value, enforced, source: newSource };
@@ -1148,7 +1152,7 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
                             data-testid={selectors.components.Config.CustomSettingsConfig.jwtTokenHeaderInput}
                             onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
                               let newSettings = customSettings.concat();
-                              newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName: changeEvent.target.value, jwtClaim, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
+                              newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName: changeEvent.target.value, jwtClaimPath, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
                               setCustomSettings(newSettings);
                             }}
                             onBlur={() => { onCustomSettingsChange(customSettings); }}
@@ -1161,14 +1165,16 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
                             </Tooltip>
                           }
                           aria-label={csLabels.jwtClaimPathInput.label}
+                          description={'Nested paths (for example ["realm_access","roles"]) can only be set via provisioning YAML.'}
                         >
                           <Input
-                            value={jwtClaim || ''}
+                            value={(jwtClaimPath && jwtClaimPath[0]) || ''}
                             placeholder={csLabels.jwtClaimPathInput.placeholder}
                             data-testid={selectors.components.Config.CustomSettingsConfig.jwtClaimPathInput}
                             onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
                               let newSettings = customSettings.concat();
-                              newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaim: changeEvent.target.value, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
+                              const nextJWTClaimPath = changeEvent.target.value ? [changeEvent.target.value] : undefined;
+                              newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaimPath: nextJWTClaimPath, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
                               setCustomSettings(newSettings);
                             }}
                             onBlur={() => { onCustomSettingsChange(customSettings); }}
@@ -1188,7 +1194,7 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
                             data-testid={selectors.components.Config.CustomSettingsConfig.jwtArrayJoinInput}
                             onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
                               let newSettings = customSettings.concat();
-                              newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaim, jwtClaimJoin: changeEvent.target.value, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
+                              newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaimPath, jwtClaimJoin: changeEvent.target.value, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
                               setCustomSettings(newSettings);
                             }}
                             onBlur={() => { onCustomSettingsChange(customSettings); }}
@@ -1211,7 +1217,7 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
                             data-testid={selectors.components.Config.CustomSettingsConfig.jwtVerifySelect}
                             onChange={(selected) => {
                               let newSettings = customSettings.concat();
-                              newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaim, jwtClaimJoin, jwtVerify: selected.value as CHCustomSettingJWTVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
+                              newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaimPath, jwtClaimJoin, jwtVerify: selected.value as CHCustomSettingJWTVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
                               setCustomSettings(newSettings);
                               onCustomSettingsChange(newSettings);
                             }}
@@ -1234,7 +1240,7 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
                                 data-testid={selectors.components.Config.CustomSettingsConfig.jwtJwksUrlInput}
                                 onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
                                   let newSettings = customSettings.concat();
-                                  newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaim, jwtClaimJoin, jwtVerify, jwtJwksUrl: changeEvent.target.value, jwtIssuer, jwtAudience };
+                                  newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaimPath, jwtClaimJoin, jwtVerify, jwtJwksUrl: changeEvent.target.value, jwtIssuer, jwtAudience };
                                   setCustomSettings(newSettings);
                                 }}
                                 onBlur={() => { onCustomSettingsChange(customSettings); }}
@@ -1254,7 +1260,7 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
                                 data-testid={selectors.components.Config.CustomSettingsConfig.jwtIssuerInput}
                                 onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
                                   let newSettings = customSettings.concat();
-                                  newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaim, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer: changeEvent.target.value, jwtAudience };
+                                  newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaimPath, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer: changeEvent.target.value, jwtAudience };
                                   setCustomSettings(newSettings);
                                 }}
                                 onBlur={() => { onCustomSettingsChange(customSettings); }}
@@ -1274,7 +1280,7 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
                                 data-testid={selectors.components.Config.CustomSettingsConfig.jwtAudienceInput}
                                 onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
                                   let newSettings = customSettings.concat();
-                                  newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaim, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience: changeEvent.target.value };
+                                  newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing, jwtHeaderName, jwtClaimPath, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience: changeEvent.target.value };
                                   setCustomSettings(newSettings);
                                 }}
                                 onBlur={() => { onCustomSettingsChange(customSettings); }}
@@ -1299,7 +1305,7 @@ export const ConfigEditor: React.FC<ConfigEditorProps> = (props) => {
                             data-testid={selectors.components.Config.CustomSettingsConfig.onMissingSelect}
                             onChange={(selected) => {
                               let newSettings = customSettings.concat();
-                              newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing: selected.value as CHCustomSettingOnMissing, jwtHeaderName, jwtClaim, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
+                              newSettings[i] = { setting, value: '', enforced, source: effectiveSource, onMissing: selected.value as CHCustomSettingOnMissing, jwtHeaderName, jwtClaimPath, jwtClaimJoin, jwtVerify, jwtJwksUrl, jwtIssuer, jwtAudience };
                               setCustomSettings(newSettings);
                               onCustomSettingsChange(newSettings);
                             }}

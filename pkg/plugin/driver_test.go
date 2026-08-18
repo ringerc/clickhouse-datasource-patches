@@ -5,17 +5,57 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
+	backendlog "github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
 	"github.com/grafana/grafana-plugin-sdk-go/data/sqlutil"
 	"github.com/grafana/sqlds/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type capturedLogEntry struct {
+	level string
+	msg   string
+	args  []interface{}
+}
+
+type captureLogger struct {
+	entries []capturedLogEntry
+}
+
+func (l *captureLogger) Debug(msg string, args ...interface{}) {
+	l.entries = append(l.entries, capturedLogEntry{level: "debug", msg: msg, args: args})
+}
+
+func (l *captureLogger) Info(msg string, args ...interface{}) {
+	l.entries = append(l.entries, capturedLogEntry{level: "info", msg: msg, args: args})
+}
+
+func (l *captureLogger) Warn(msg string, args ...interface{}) {
+	l.entries = append(l.entries, capturedLogEntry{level: "warn", msg: msg, args: args})
+}
+
+func (l *captureLogger) Error(msg string, args ...interface{}) {
+	l.entries = append(l.entries, capturedLogEntry{level: "error", msg: msg, args: args})
+}
+
+func (l *captureLogger) With(args ...interface{}) backendlog.Logger {
+	return l
+}
+
+func (l *captureLogger) Level() backendlog.Level {
+	return backendlog.Debug
+}
+
+func (l *captureLogger) FromContext(ctx context.Context) backendlog.Logger {
+	return l
+}
 
 func TestMergeOpenTelemetryLabels(t *testing.T) {
 	t.Run("Merge", func(t *testing.T) {
@@ -1278,7 +1318,7 @@ func makeJWTBoundPlugin(t *testing.T, settingName, headerName, claimPath, onMiss
 		Setting:       settingName,
 		Enforced:      true,
 		Source:        CustomSettingSourceJWT,
-		JWTClaim:      claimPath,
+		JWTClaimPath:  []string{claimPath},
 		JWTHeaderName: headerName,
 		JWTVerify:     CustomSettingJWTVerifyNone,
 		OnMissing:     onMissing,
@@ -1438,6 +1478,112 @@ func TestExtractForwardedHeadersFromMessage_Hardening(t *testing.T) {
 		assert.NotContains(t, headers, "X-Empty")
 		assert.Equal(t, "value", headers["X-Single"])
 	})
+}
+
+func makeForwardedHeaderRequest(httpHeaders map[string]string, bodyHeaders map[string]string) *backend.QueryDataRequest {
+	headers := make(map[string]string, len(httpHeaders))
+	for k, v := range httpHeaders {
+		headers["http_"+k] = v
+	}
+
+	grafanaHTTPHeaders := make(map[string][]string, len(bodyHeaders))
+	for k, v := range bodyHeaders {
+		grafanaHTTPHeaders[k] = []string{v}
+	}
+	query := map[string]interface{}{
+		"rawSql": "SELECT 1",
+	}
+	if len(grafanaHTTPHeaders) > 0 {
+		query["grafana-http-headers"] = grafanaHTTPHeaders
+	}
+	jsonBytes, _ := json.Marshal(query)
+
+	return &backend.QueryDataRequest{
+		Headers: headers,
+		Queries: []backend.DataQuery{{JSON: jsonBytes}},
+	}
+}
+
+func TestMutateQueryData_ForwardedHeaderPrecedence(t *testing.T) {
+	h := &Clickhouse{}
+
+	t.Run("HTTP header wins over query body", func(t *testing.T) {
+		req := makeForwardedHeaderRequest(
+			map[string]string{"X-Grafana-Id": "real"},
+			map[string]string{"X-Grafana-Id": "forged"},
+		)
+
+		ctx, _ := h.MutateQueryData(t.Context(), req)
+		fwdHeaders := forwardedHeadersFromContext(ctx)
+
+		assert.Equal(t, "real", fwdHeaders["X-Grafana-Id"])
+	})
+
+	t.Run("query body only still populates forwarded headers", func(t *testing.T) {
+		req := makeForwardedHeaderRequest(
+			nil,
+			map[string]string{"X-Grafana-Id": "body-only"},
+		)
+
+		ctx, _ := h.MutateQueryData(t.Context(), req)
+		fwdHeaders := forwardedHeadersFromContext(ctx)
+
+		assert.Equal(t, "body-only", fwdHeaders["X-Grafana-Id"])
+	})
+
+	t.Run("HTTP only still populates forwarded headers", func(t *testing.T) {
+		req := makeForwardedHeaderRequest(
+			map[string]string{"X-Grafana-Id": "http-only"},
+			nil,
+		)
+
+		ctx, _ := h.MutateQueryData(t.Context(), req)
+		fwdHeaders := forwardedHeadersFromContext(ctx)
+
+		assert.Equal(t, "http-only", fwdHeaders["X-Grafana-Id"])
+	})
+}
+
+func TestMutateQueryData_HeaderPrecedenceOverrideWarn(t *testing.T) {
+	logger := &captureLogger{}
+	previousLogger := backend.Logger
+	backend.Logger = logger
+	t.Cleanup(func() {
+		backend.Logger = previousLogger
+	})
+
+	req := makeForwardedHeaderRequest(
+		map[string]string{"X-Grafana-Id": "real"},
+		map[string]string{"X-Grafana-Id": "forged"},
+	)
+	h := &Clickhouse{}
+
+	ctx, _ := h.MutateQueryData(t.Context(), req)
+	fwdHeaders := forwardedHeadersFromContext(ctx)
+	assert.Equal(t, "real", fwdHeaders["X-Grafana-Id"])
+
+	require.Len(t, logger.entries, 1)
+	entry := logger.entries[0]
+	assert.Equal(t, "warn", entry.level)
+	assert.Equal(t, "dropping query-body header override; HTTP header takes precedence", entry.msg)
+
+	fields := map[string]interface{}{}
+	for i := 0; i+1 < len(entry.args); i += 2 {
+		key, ok := entry.args[i].(string)
+		if ok {
+			fields[key] = entry.args[i+1]
+		}
+	}
+	assert.Equal(t, "X-Grafana-Id", fields["header"])
+	assert.Equal(t, len("real"), fields["http_len"])
+	assert.Equal(t, len("forged"), fields["body_len"])
+
+	for _, arg := range entry.args {
+		if s, ok := arg.(string); ok {
+			assert.False(t, strings.Contains(s, "real"), "log args must not include raw HTTP header value")
+			assert.False(t, strings.Contains(s, "forged"), "log args must not include raw body header value")
+		}
+	}
 }
 
 func TestMutateQueryData_MultiValuedHeaderRejection(t *testing.T) {

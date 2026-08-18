@@ -433,13 +433,13 @@ func makeJWTDSSettings(t *testing.T, protocol clickhouse_sql.Protocol, settingNa
 
 	csJSON, _ := json.Marshal([]map[string]interface{}{
 		{
-			"setting":      settingName,
-			"enforced":     true,
-			"source":       "jwt",
-			"jwtClaim":     "tenants",
+			"setting":       settingName,
+			"enforced":      true,
+			"source":        "jwt",
+			"jwtClaimPath":  []string{"tenants"},
 			"jwtHeaderName": "X-Token",
-			"jwtVerify":    "jwks",
-			"jwtJwksUrl":   jwksURL,
+			"jwtVerify":     "jwks",
+			"jwtJwksUrl":    jwksURL,
 		},
 	})
 	jsonData := fmt.Sprintf(

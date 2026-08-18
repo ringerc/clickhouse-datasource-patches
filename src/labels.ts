@@ -122,7 +122,7 @@ export default {
             label: 'Claim path',
             placeholder: 'tenants',
             tooltip:
-              'Dot-separated path to the claim inside the JWT payload, e.g. "tenants" or "https://example.com/tenants".',
+              'JWT claim path (single segment). For nested claims, use provisioning YAML.',
           },
           jwtArrayJoinInput: {
             label: 'Array join',

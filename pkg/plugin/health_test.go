@@ -150,6 +150,31 @@ func TestRunEnforcedHealthProbes_UnexpectedExecError_Warning(t *testing.T) {
 	assert.Nil(t, result, "non-164 error from override probe is a warning, not a failure")
 }
 
+func TestRunEnforcedHealthProbes_OverrideProbeRetriesIntegerAfterTypeError(t *testing.T) {
+	s := makeEnforcedTestSettings("max_threads", "4")
+	var execQueries []string
+	p := fakeProber(
+		func(_ context.Context, q string) (string, error) {
+			if strings.Contains(q, "system.settings") {
+				return "0", nil
+			}
+			return "4", nil
+		},
+		func(_ context.Context, q string) error {
+			execQueries = append(execQueries, q)
+			if len(execQueries) == 1 {
+				return &clickhouse.Exception{Code: 36}
+			}
+			return &clickhouse.Exception{Code: 164}
+		},
+	)
+	result := runEnforcedHealthProbes(context.Background(), s, p)
+	assert.Nil(t, result)
+	require.Len(t, execQueries, 2)
+	assert.Contains(t, execQueries[0], "max_threads = '__grafana_enforced_probe__'")
+	assert.Contains(t, execQueries[1], "max_threads = 0")
+}
+
 func TestRunEnforcedHealthProbes_MultipleSettings_FirstFails(t *testing.T) {
 	s := Settings{
 		EnforceReadOnly: true,
@@ -329,7 +354,7 @@ func makeJWTBoundSettings(settingName, headerName, claimPath, verify, jwksURL st
 		Setting:       settingName,
 		Enforced:      true,
 		Source:        CustomSettingSourceJWT,
-		JWTClaim:      claimPath,
+		JWTClaimPath:  []string{claimPath},
 		JWTHeaderName: headerName,
 		JWTVerify:     verify,
 		OnMissing:     onMissingReject,
@@ -542,7 +567,7 @@ func TestCheckForwardHeadersGate_ToggleOff_JWTOnCustomHeader_Fails(t *testing.T)
 				Enforced:      true,
 				Source:        CustomSettingSourceJWT,
 				JWTHeaderName: "X-Id-Token",
-				JWTClaim:      "tenants",
+				JWTClaimPath:  []string{"tenants"},
 				JWTVerify:     CustomSettingJWTVerifyNone,
 				OnMissing:     onMissingReject,
 			},
@@ -564,13 +589,31 @@ func TestCheckForwardHeadersGate_ToggleOff_JWTOnXGrafanaId_Passes(t *testing.T) 
 				Enforced:      true,
 				Source:        CustomSettingSourceJWT,
 				JWTHeaderName: "X-Grafana-Id",
-				JWTClaim:      "tenants",
+				JWTClaimPath:  []string{"tenants"},
 				JWTVerify:     CustomSettingJWTVerifyNone,
 				OnMissing:     onMissingReject,
 			},
 		},
 	}
 	assert.Nil(t, checkForwardHeadersGate(s))
+}
+
+func TestXGrafanaIdAdvisory_DefaultJWTHeaderPresent(t *testing.T) {
+	s := makeJWTBoundSettings("custom_x", "", "tenants", CustomSettingJWTVerifyNone, "")
+	advisory := xGrafanaIdAdvisory(s)
+	require.NotEmpty(t, advisory)
+	assert.Contains(t, advisory, "X-Grafana-Id")
+	assert.Contains(t, advisory, "idForwarding")
+}
+
+func TestXGrafanaIdAdvisory_CustomJWTHeaderAbsent(t *testing.T) {
+	s := makeJWTBoundSettings("custom_x", "X-Id-Token", "tenants", CustomSettingJWTVerifyNone, "")
+	assert.Empty(t, xGrafanaIdAdvisory(s))
+}
+
+func TestXGrafanaIdAdvisory_NoEnforcedBindingsAbsent(t *testing.T) {
+	s := Settings{CustomSettings: []CustomSetting{{Setting: "custom_x", Source: customSettingSourceHeader, HeaderName: "X-Grafana-Id"}}}
+	assert.Empty(t, xGrafanaIdAdvisory(s))
 }
 
 // ---------------------------------------------------------------------------

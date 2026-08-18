@@ -115,7 +115,7 @@ export interface CHCustomSetting {
    * Where the effective value comes from at query time.
    *  - undefined / "static": use `value` verbatim (default; the only mode for non-enforced rows).
    *  - "header": read from the named HTTP header on each request; `headerName` is required and `value` must be empty.
-   *  - "jwt": read a claim from a JWT in the named HTTP header on each request; `jwtClaim` is required and `value` must be empty.
+   *  - "jwt": read a claim from a JWT in the named HTTP header on each request; `jwtClaimPath` is a JSON-key segment array and `value` must be empty.
    * Only meaningful when `enforced === true`.
    */
   source?: CHCustomSettingSource;
@@ -127,8 +127,8 @@ export interface CHCustomSetting {
   // JWT-source fields — only meaningful when source === "jwt".
   /** HTTP header carrying the JWT. Defaults to "X-Grafana-Id". Canonicalised server-side. */
   jwtHeaderName?: string;
-  /** Dotted claim path, e.g. "tenants" or "a.b.c". Required when source === "jwt". */
-  jwtClaim?: string;
+  /** Claim key path; each element is one literal JSON key, e.g. ["https://myapp.example.com/roles"] or ["realm_access", "roles"]. */
+  jwtClaimPath?: string[];
   /** Separator used to join array claims into a single string. Defaults to ",". */
   jwtClaimJoin?: string;
   /** Signature verification mode. Defaults to "none" (trust forwarded token). */

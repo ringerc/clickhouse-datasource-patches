@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 	keyfunc "github.com/MicahParks/keyfunc/v3"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
+	"golang.org/x/sync/singleflight"
 	"golang.org/x/time/rate"
 )
 
@@ -40,6 +42,7 @@ type jwksCache struct {
 	mu        sync.Mutex
 	entries   map[string]keyfunc.Keyfunc
 	failures  map[string]time.Time
+	sf        singleflight.Group
 	client    *http.Client
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -94,16 +97,24 @@ func (c *jwksCache) getOrCreate(url string) (keyfunc.Keyfunc, error) {
 	c.mu.Unlock()
 
 	// Build outside the lock; initial HTTP fetch may take up to jwksFetchTimeout.
-	kf, err := buildJWKSKeyfunc(c.ctx, url, c.client)
+	v, err, _ := c.sf.Do(url, func() (interface{}, error) {
+		kf, err := buildJWKSKeyfunc(c.ctx, url, c.client)
+		if err != nil {
+			c.mu.Lock()
+			if _, ok := c.entries[url]; !ok {
+				c.failures[url] = time.Now()
+			}
+			c.mu.Unlock()
+		}
+		return kf, err
+	})
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err != nil {
-		if _, ok := c.entries[url]; !ok {
-			c.failures[url] = time.Now()
-		}
 		return nil, fmt.Errorf("JWKS fetch failed for %q: %w", url, err)
 	}
+	kf := v.(keyfunc.Keyfunc)
 	// Double-check: another goroutine may have created it while we built.
 	if existing, ok := c.entries[url]; ok {
 		return existing, nil
@@ -118,16 +129,18 @@ func (c *jwksCache) getOrCreate(url string) (keyfunc.Keyfunc, error) {
 // runs until ctx is cancelled — pass the jwksCache-owned ctx so Dispose can
 // terminate it.
 func buildJWKSKeyfunc(ctx context.Context, url string, client *http.Client) (keyfunc.Keyfunc, error) {
+	return keyfunc.NewDefaultOverrideCtx(ctx, []string{url}, jwksOverride(client))
+}
+
+func jwksOverride(client *http.Client) keyfunc.Override {
 	noErrFirst := false // fail fast on initial fetch failure
-	unk := rate.NewLimiter(rate.Every(5*time.Minute), 1)
-	override := keyfunc.Override{
+	return keyfunc.Override{
 		Client:                    client,
 		HTTPTimeout:               jwksFetchTimeout,
 		RefreshInterval:           jwksRefreshInterval,
-		RefreshUnknownKID:         unk,
+		RefreshUnknownKID:         rate.NewLimiter(rate.Every(5*time.Minute), 1),
 		NoErrorReturnFirstHTTPReq: &noErrFirst,
 	}
-	return keyfunc.NewDefaultOverrideCtx(ctx, []string{url}, override)
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +237,20 @@ func (j *jwtValueSource) Resolve(ctx context.Context) (string, bool, error) {
 				return "", false, nil
 			} else if expired {
 				backend.Logger.Warn("jwt in header is expired; treating as absent (verify=none, non-trusted header)",
+					"setting", j.settingName,
+					"header", j.headerName,
+				)
+				return "", false, nil
+			}
+			if notYetValid, err := jwtIsNotYetValid(mc); err != nil {
+				backend.Logger.Warn("jwt in header has malformed nbf claim; treating as absent (verify=none)",
+					"setting", j.settingName,
+					"header", j.headerName,
+					"error", err,
+				)
+				return "", false, nil
+			} else if notYetValid {
+				backend.Logger.Warn("jwt in header is not yet valid; treating as absent (verify=none, non-trusted header)",
 					"setting", j.settingName,
 					"header", j.headerName,
 				)
@@ -343,6 +370,33 @@ func jwtIsExpired(claims jwt.MapClaims) (bool, error) {
 	return time.Now().Add(-leeway).After(time.Unix(expUnix, 0)), nil
 }
 
+// jwtIsNotYetValid returns (true, nil) when the token's `nbf` claim is in the
+// future (with a 60s leeway). It returns (false, nil) when the claim is absent
+// (RFC 7519 makes `nbf` optional). A malformed `nbf` yields an error so the
+// caller can log it — treating a broken nbf as "valid now" would defeat the
+// freshness check.
+func jwtIsNotYetValid(claims jwt.MapClaims) (bool, error) {
+	raw, ok := claims["nbf"]
+	if !ok {
+		return false, nil
+	}
+	var nbfUnix int64
+	switch v := raw.(type) {
+	case float64:
+		nbfUnix = int64(v)
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil {
+			return false, fmt.Errorf("nbf is not an integer: %w", err)
+		}
+		nbfUnix = n
+	default:
+		return false, fmt.Errorf("nbf has unsupported type %T", raw)
+	}
+	const leeway = 60 * time.Second
+	return time.Now().Add(leeway).Before(time.Unix(nbfUnix, 0)), nil
+}
+
 // categoriseJWTError maps a jwt parse/verify error to a short descriptive reason.
 func categoriseJWTError(err error) string {
 	switch {
@@ -372,7 +426,7 @@ func categoriseJWTError(err error) string {
 // Claim extraction
 // ---------------------------------------------------------------------------
 
-// extractJWTClaim walks claims by dotted path segments and returns the
+// extractJWTClaim walks claims by literal path segments and returns the
 // converted string value.
 //   - Returns ("", false, nil)  when any segment along the path is absent or nil.
 //   - Returns ("", false, err)  when the leaf or an intermediate is an unsupported type.
@@ -404,7 +458,7 @@ func convertClaimValue(v interface{}, joinSep, settingName, claimDotted string) 
 	case string:
 		return t, true, nil
 	case float64:
-		return fmt.Sprint(t), true, nil
+		return strconv.FormatFloat(t, 'f', -1, 64), true, nil
 	case bool:
 		if t {
 			return "true", true, nil
@@ -421,7 +475,7 @@ func convertClaimValue(v interface{}, joinSep, settingName, claimDotted string) 
 			case string:
 				parts = append(parts, ev)
 			case float64:
-				parts = append(parts, fmt.Sprint(ev))
+				parts = append(parts, strconv.FormatFloat(ev, 'f', -1, 64))
 			case bool:
 				if ev {
 					parts = append(parts, "true")
@@ -437,6 +491,10 @@ func convertClaimValue(v interface{}, joinSep, settingName, claimDotted string) 
 					"jwt claim %q for setting %q has unsupported array element type %T",
 					claimDotted, settingName, elem)
 			}
+		}
+		if len(parts) == 0 {
+			// Nil elements are skipped, so [] and [nil] are absent; [""] remains present.
+			return "", false, nil
 		}
 		return strings.Join(parts, joinSep), true, nil
 	case map[string]interface{}:
@@ -460,8 +518,8 @@ func jwtValueSourceFactory(cs CustomSetting, rt EnforcedSourceRuntime) (Enforced
 	if !cs.Enforced {
 		return nil, fmt.Errorf("source=jwt requires enforced=true")
 	}
-	if cs.JWTClaim == "" {
-		return nil, fmt.Errorf("source=jwt requires jwtClaim")
+	if len(cs.JWTClaimPath) == 0 {
+		return nil, fmt.Errorf("source=jwt requires jwtClaimPath")
 	}
 	if cs.Value != "" {
 		return nil, fmt.Errorf("source=jwt must not set value")
@@ -493,7 +551,7 @@ func jwtValueSourceFactory(cs CustomSetting, rt EnforcedSourceRuntime) (Enforced
 	src := &jwtValueSource{
 		settingName: cs.Setting,
 		headerName:  headerName,
-		claimPath:   strings.Split(cs.JWTClaim, "."),
+		claimPath:   cs.JWTClaimPath,
 		joinSep:     joinSep,
 		verify:      verify,
 		jwksURL:     cs.JWTJWKSURL,

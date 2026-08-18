@@ -48,6 +48,11 @@ func headerIsAlwaysForwarded(headerName string) bool {
 	return ok
 }
 
+func newJWKSHTTPClient(settings Settings) *http.Client {
+	// TODO: inherit datasource TLS (custom CA, client cert) and proxy settings — tracked as follow-up.
+	return &http.Client{Timeout: jwksFetchTimeout}
+}
+
 // clickhouseInstance wraps the sqlds-managed instance so its Dispose also
 // closes the SchemaProvider's shared *sql.DB and terminates the JWKS cache's
 // background refresh goroutines. Embedding *sqlds.SQLDatasource promotes every
@@ -99,7 +104,7 @@ func NewDatasource(ctx context.Context, settings backend.DataSourceInstanceSetti
 
 		// Create the per-instance JWKS cache so JWT-sourced bindings that use
 		// verify=jwks can share a single keyfunc per URL across all bindings.
-		cache := newJWKSCache(nil) // nil → http.DefaultClient
+		cache := newJWKSCache(newJWKSHTTPClient(s))
 		clickhousePlugin.jwksCache = cache
 
 		rt := EnforcedSourceRuntime{JWKSCache: cache}

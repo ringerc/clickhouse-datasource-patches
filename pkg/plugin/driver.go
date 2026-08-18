@@ -600,28 +600,34 @@ func (h *Clickhouse) MutateQueryData(
 	injectGrafanaUserHeader(ctx, req)
 
 	// Build the canonicalised forwarded-headers map from two sources:
-	//   1. The query JSON body (sqlds's grafana-http-headers key) — used when
+	//   1. The HTTP-level req.GetHTTPHeaders() map. These headers have highest
+	//      precedence because they are supplied by Grafana/proxy request handling.
+	//   2. The query JSON body (sqlds's grafana-http-headers key) — used when
 	//      ForwardHeaders is on and sqlds serialises them into ConnectionArgs.
-	//   2. The HTTP-level req.GetHTTPHeaders() map — fallback for plain header
-	//      forwarding or single-header test setups.
 	fwdRaw, _ := extractForwardedHeadersFromMessage(firstQueryMessage(req))
 	canon := make(map[string]string, len(fwdRaw)+len(httpHeaders))
-	for k, v := range fwdRaw {
-		canon[http.CanonicalHeaderKey(k)] = v
-	}
 	for k, vv := range httpHeaders {
 		ck := http.CanonicalHeaderKey(k)
-		if _, exists := canon[ck]; !exists {
-			if len(vv) == 0 {
-				continue
-			}
-			if len(vv) > 1 {
-				backend.Logger.Warn("dropping multi-valued forwarded header; configure your proxy to send a single value",
-					"header", ck, "value_count", len(vv))
-				continue
-			}
-			canon[ck] = vv[0]
+		if len(vv) == 0 {
+			continue
 		}
+		if len(vv) > 1 {
+			backend.Logger.Warn("dropping multi-valued forwarded header; configure your proxy to send a single value",
+				"header", ck, "value_count", len(vv))
+			continue
+		}
+		canon[ck] = vv[0]
+	}
+	for k, v := range fwdRaw {
+		ck := http.CanonicalHeaderKey(k)
+		if existing, exists := canon[ck]; exists {
+			if existing != v {
+				backend.Logger.Warn("dropping query-body header override; HTTP header takes precedence",
+					"header", ck, "http_len", len(existing), "body_len", len(v))
+			}
+			continue
+		}
+		canon[ck] = v
 	}
 	ctx = WithForwardedHeaders(ctx, canon)
 

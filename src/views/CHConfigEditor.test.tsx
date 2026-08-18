@@ -424,7 +424,7 @@ describe('ConfigEditor', () => {
                 enforced: true,
                 source: 'jwt',
                 jwtHeaderName: 'X-Grafana-Id',
-                jwtClaim: 'tenants',
+                jwtClaimPath: ['tenants'],
                 jwtVerify: 'none',
               },
             ],
@@ -457,7 +457,7 @@ describe('ConfigEditor', () => {
                 enforced: true,
                 source: 'jwt',
                 jwtHeaderName: 'X-Grafana-Id',
-                jwtClaim: 'tenants',
+                jwtClaimPath: ['tenants'],
                 jwtVerify: 'jwks',
                 jwtJwksUrl: 'https://issuer.example/.well-known/jwks.json',
                 jwtIssuer: 'https://issuer.example',
@@ -488,10 +488,10 @@ describe('ConfigEditor', () => {
       expect(screen.queryByTestId(csSelectors.jwtInfoBanner)).not.toBeInTheDocument();
     });
 
-    it('JWT row with jwtClaim survives persistence filter on blur', () => {
+    it('JWT row with jwtClaimPath survives persistence filter on blur', () => {
       const props = mockConfigEditorProps({
         customSettings: [
-          { setting: 'custom_x', value: '', enforced: true, source: 'jwt', jwtClaim: 'tenants' },
+          { setting: 'custom_x', value: '', enforced: true, source: 'jwt', jwtClaimPath: ['tenants'] },
         ],
       });
       render(<ConfigEditor {...props} />);
@@ -503,14 +503,14 @@ describe('ConfigEditor', () => {
         expect.objectContaining({
           jsonData: expect.objectContaining({
             customSettings: expect.arrayContaining([
-              expect.objectContaining({ setting: 'custom_x', source: 'jwt', jwtClaim: 'tenants' }),
+              expect.objectContaining({ setting: 'custom_x', source: 'jwt', jwtClaimPath: ['tenants'] }),
             ]),
           }),
         })
       );
     });
 
-    it('JWT row without jwtClaim is dropped by persistence filter', () => {
+    it('JWT row without jwtClaimPath is dropped by persistence filter', () => {
       const props = mockConfigEditorProps({
         customSettings: [
           { setting: 'custom_x', value: '', enforced: true, source: 'jwt' },
@@ -524,6 +524,28 @@ describe('ConfigEditor', () => {
       const call = (props.onOptionsChange as jest.Mock).mock.calls.slice(-1)[0][0];
       expect(call.jsonData.customSettings).toHaveLength(0);
     });
+
+    it('JWT claim path input preserves dots as a single segment array', () => {
+      const props = mockConfigEditorProps({
+        customSettings: [
+          { setting: 'custom_x', value: '', enforced: true, source: 'jwt', jwtClaimPath: ['tenants'] },
+        ],
+      });
+      render(<ConfigEditor {...props} />);
+
+      const claimPathInput = screen.getByTestId(csSelectors.jwtClaimPathInput);
+      fireEvent.change(claimPathInput, { target: { value: 'https://example.com/roles' } });
+      fireEvent.blur(claimPathInput);
+
+      expect(props.onOptionsChange).toHaveBeenCalledWith(
+        expect.objectContaining({
+          jsonData: expect.objectContaining({
+            customSettings: expect.arrayContaining([
+              expect.objectContaining({ setting: 'custom_x', source: 'jwt', jwtClaimPath: ['https://example.com/roles'] }),
+            ]),
+          }),
+        })
+      );
+    });
   });
 });
-

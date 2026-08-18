@@ -179,17 +179,41 @@ func runEnforcedHealthProbes(ctx context.Context, s Settings, p dbProber) *backe
 				),
 			}
 		}
-		// Code 164 (READONLY) is the expected outcome. Any other error is ambiguous —
-		// log a warning but do not fail the health check.
-		var ex *clickhouse.Exception
-		if !errors.As(execErr, &ex) || ex.Code != 164 {
-			backend.Logger.Warn("enforced-settings health: override probe returned unexpected error",
+		// Code 164 (READONLY) is the expected outcome. A type error can happen
+		// before READONLY is checked for numeric settings, so retry once with an
+		// integer literal before treating the result as inconclusive.
+		if isClickHouseReadonlyError(execErr) {
+			continue
+		}
+
+		iCtx, iCancel := context.WithTimeout(enforcedCtx, timeout)
+		retryErr := p.execQuery(iCtx, fmt.Sprintf("SELECT 1 SETTINGS %s = 0", b.Setting))
+		iCancel()
+		if retryErr == nil {
+			return &backend.CheckHealthResult{
+				Status: backend.HealthStatusError,
+				Message: fmt.Sprintf(
+					"Server permits per-query override of enforced setting %q. "+
+						"Check your ClickHouse settings-constraints profile: the setting must not be marked CHANGEABLE_IN_READONLY.",
+					b.Setting,
+				),
+			}
+		}
+		if !isClickHouseReadonlyError(retryErr) {
+			backend.Logger.Warn("enforced-settings health: override probe returned unexpected errors",
 				"setting", b.Setting,
+				"string_error", execErr,
+				"integer_error", retryErr,
 			)
 		}
 	}
 
 	return nil
+}
+
+func isClickHouseReadonlyError(err error) bool {
+	var ex *clickhouse.Exception
+	return errors.As(err, &ex) && ex.Code == 164
 }
 
 // makeEnforcedSettingsHealthCheck returns a sqlds-compatible PostCheckHealth function
@@ -287,6 +311,10 @@ func makeEnforcedSettingsHealthCheck(s Settings, instanceSettings backend.DataSo
 			}
 		}
 
+		if advisory := xGrafanaIdAdvisory(s); advisory != "" {
+			infoLines = append(infoLines, advisory)
+		}
+
 		if len(infoLines) == 0 {
 			return nil
 		}
@@ -315,14 +343,8 @@ func probeJWKSURL(ctx context.Context, url string) error {
 	probeCtx, cancel := context.WithCancel(ctx)
 	defer cancel() // terminates the keyfunc refresh goroutine on return
 
-	client := &http.Client{Timeout: jwksFetchTimeout}
-	noErrFirst := false
-	kf, err := keyfunc.NewDefaultOverrideCtx(probeCtx, []string{url}, keyfunc.Override{
-		Client:                    client,
-		HTTPTimeout:               jwksFetchTimeout,
-		RefreshInterval:           jwksRefreshInterval,
-		NoErrorReturnFirstHTTPReq: &noErrFirst,
-	})
+	client := newJWKSHTTPClient(Settings{})
+	kf, err := keyfunc.NewDefaultOverrideCtx(probeCtx, []string{url}, jwksOverride(client))
 	if err != nil {
 		return err
 	}
@@ -337,6 +359,30 @@ func probeJWKSURL(ctx context.Context, url string) error {
 		return fmt.Errorf("JWKS document contains no keys")
 	}
 	return nil
+}
+
+func xGrafanaIdAdvisory(s Settings) string {
+	for _, cs := range s.CustomSettings {
+		if !cs.Enforced {
+			continue
+		}
+		var header string
+		switch cs.Source {
+		case customSettingSourceHeader:
+			header = cs.HeaderName
+		case CustomSettingSourceJWT:
+			header = cs.JWTHeaderName
+			if header == "" {
+				header = defaultJWTHeaderName
+			}
+		default:
+			continue
+		}
+		if http.CanonicalHeaderKey(header) == defaultJWTHeaderName {
+			return "This datasource has enforced binding(s) sourced from X-Grafana-Id. That header is only forwarded when Grafana's `idForwarding` feature toggle is enabled; if it is off, the binding will silently fall through to OnMissing."
+		}
+	}
+	return ""
 }
 
 // checkForwardHeadersGate returns a health-check error when any enforced

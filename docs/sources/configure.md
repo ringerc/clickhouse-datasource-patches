@@ -245,7 +245,7 @@ The mapping between UI fields on a Custom Setting row and provisioning keys is:
 | **Source**       | `source`                                        | all                  | `static` (default), `header`, or `jwt`.                                                     |
 | **Header name**  | `headerName`                                    | header               | Required; canonicalised via `http.CanonicalHeaderKey`. Multi-valued headers are rejected.   |
 | **Token header** | `jwtHeaderName`                                 | jwt                  | Defaults to `X-Grafana-Id` when blank. Grafana's `X-Grafana-Id` is a re-minted token that carries only a small set of Grafana-native claims — for IdP-native claims (groups, email, tenant claims) point at `X-Id-Token` or a custom header and enable **Forward Grafana HTTP Headers**. See [Choosing the token header](#choosing-the-token-header). |
-| **Claim path**   | `jwtClaim`                                      | jwt                  | Required. Dotted path (e.g. `tenants` or `app.tenant.id`).                                  |
+| **Claim path**   | `jwtClaimPath`                                  | jwt                  | Required. JSON array of claim key segments. Each element is one literal JSON key — dots are NOT interpreted. Example: `["tenants"]` for a top-level `tenants` claim, or `["realm_access", "roles"]` for a nested path. URI-namespaced claim keys work without escaping: `["https://myapp.example.com/roles"]`. |
 | **Array join**   | `jwtClaimJoin`                                  | jwt                  | Separator for array-valued claims. Defaults to `,`.                                         |
 | **Verify**       | `jwtVerify`                                     | jwt                  | `none` (default) or `jwks`. See [Signature verification](#jwt-signature-verification).      |
 | **JWKS URL**     | `jwtJwksUrl`                                    | jwt (verify=jwks)    | Required when `jwtVerify: jwks`.                                                            |
@@ -320,7 +320,7 @@ jsonData:
       enforced: true
       source: jwt
       jwtHeaderName: X-Grafana-Id   # optional; defaults to X-Grafana-Id
-      jwtClaim: tenants             # required
+      jwtClaimPath: [tenants]       # required
       jwtClaimJoin: ','             # optional; defaults to ","
       jwtVerify: none               # "none" (default) or "jwks"
       onMissing: reject             # "reject" (default) or "empty"
@@ -388,7 +388,7 @@ jsonData:
       enforced: true
       source: jwt
       jwtHeaderName: X-Grafana-Id
-      jwtClaim: tenants
+      jwtClaimPath: [tenants]
       jwtVerify: none
       onMissing: reject
 ```
@@ -403,7 +403,7 @@ jsonData:
       enforced: true
       source: jwt
       jwtHeaderName: X-Id-Token
-      jwtClaim: tenants
+      jwtClaimPath: [tenants]
       jwtVerify: jwks
       jwtJwksUrl: https://idp.example/.well-known/jwks.json
       jwtIssuer: https://idp.example

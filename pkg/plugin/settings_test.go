@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/backend/proxy"
 	sdkconfig "github.com/grafana/grafana-plugin-sdk-go/config"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestLoadSettings(t *testing.T) {
@@ -30,6 +32,7 @@ func TestLoadSettings(t *testing.T) {
 		type args struct {
 			config backend.DataSourceInstanceSettings
 		}
+
 		tests := []struct {
 			name         string
 			args         args
@@ -114,17 +117,17 @@ func TestLoadSettings(t *testing.T) {
 					},
 				},
 				wantSettings: Settings{
-					Host:               "test",
-					Port:               443,
-					Path:               "custom-path",
-					InsecureSkipVerify: true,
-					TlsClientAuth:      true,
-					TlsAuthWithCACert:  true,
-					ConnMaxLifetime:    "5",
-					DialTimeout:        "10",
-					MaxIdleConns:       "25",
-					MaxOpenConns:       "50",
-					QueryTimeout:       "60",
+					Host:                  "test",
+					Port:                  443,
+					Path:                  "custom-path",
+					InsecureSkipVerify:    true,
+					TlsClientAuth:         true,
+					TlsAuthWithCACert:     true,
+					ConnMaxLifetime:       "5",
+					DialTimeout:           "10",
+					MaxIdleConns:          "25",
+					MaxOpenConns:          "50",
+					QueryTimeout:          "60",
 					ProxyOptions:          nil,
 					EnableRowLimit:        true,
 					RowLimit:              1000000,
@@ -143,12 +146,12 @@ func TestLoadSettings(t *testing.T) {
 					},
 				},
 				wantSettings: Settings{
-					Host:            "test",
-					Port:            443,
-					ConnMaxLifetime: "5",
-					DialTimeout:     "10",
-					MaxIdleConns:    "25",
-					MaxOpenConns:    "50",
+					Host:                  "test",
+					Port:                  443,
+					ConnMaxLifetime:       "5",
+					DialTimeout:           "10",
+					MaxIdleConns:          "25",
+					MaxOpenConns:          "50",
 					QueryTimeout:          "60",
 					RowLimit:              1000000,
 					EnableRowLimit:        true,
@@ -234,12 +237,12 @@ func TestLoadSettings(t *testing.T) {
 					},
 				},
 				wantSettings: Settings{
-					Host:            "test",
-					Port:            443,
-					ConnMaxLifetime: "5",
-					DialTimeout:     "15",
-					MaxIdleConns:    "25",
-					MaxOpenConns:    "50",
+					Host:                  "test",
+					Port:                  443,
+					ConnMaxLifetime:       "5",
+					DialTimeout:           "15",
+					MaxIdleConns:          "25",
+					MaxOpenConns:          "50",
 					QueryTimeout:          "120",
 					EnableRowLimit:        false,
 					EnableSchemaCache:     true,
@@ -257,12 +260,12 @@ func TestLoadSettings(t *testing.T) {
 					},
 				},
 				wantSettings: Settings{
-					Host:            "test",
-					Port:            443,
-					ConnMaxLifetime: "5",
-					DialTimeout:     "25",
-					MaxIdleConns:    "25",
-					MaxOpenConns:    "50",
+					Host:                  "test",
+					Port:                  443,
+					ConnMaxLifetime:       "5",
+					DialTimeout:           "25",
+					MaxIdleConns:          "25",
+					MaxOpenConns:          "50",
 					QueryTimeout:          "60",
 					EnableRowLimit:        false,
 					EnableSchemaCache:     true,
@@ -280,12 +283,12 @@ func TestLoadSettings(t *testing.T) {
 					},
 				},
 				wantSettings: Settings{
-					Host:            "test",
-					Port:            443,
-					ConnMaxLifetime: "5",
-					DialTimeout:     "10",
-					MaxIdleConns:    "25",
-					MaxOpenConns:    "50",
+					Host:                  "test",
+					Port:                  443,
+					ConnMaxLifetime:       "5",
+					DialTimeout:           "10",
+					MaxIdleConns:          "25",
+					MaxOpenConns:          "50",
 					QueryTimeout:          "60",
 					EnableRowLimit:        false,
 					EnableSchemaCache:     true,
@@ -410,10 +413,10 @@ func TestLoadSettings(t *testing.T) {
 	t.Run("should parse enforced flag on custom settings", func(t *testing.T) {
 		ctx := context.Background()
 		tests := []struct {
-			description    string
-			jsonData       string
-			wantEnforced   []bool
-			wantReadOnly   bool
+			description  string
+			jsonData     string
+			wantEnforced []bool
+			wantReadOnly bool
 		}{
 			{
 				description:  "enforced absent defaults to false",
@@ -639,10 +642,10 @@ func TestLoadSettings(t *testing.T) {
 
 		t.Run("happy path: defaults filled in and canonicalized", func(t *testing.T) {
 			cs := CustomSetting{
-				Setting:  "tenant",
-				Enforced: true,
-				Source:   CustomSettingSourceJWT,
-				JWTClaim: "tenants",
+				Setting:      "tenant",
+				Enforced:     true,
+				Source:       CustomSettingSourceJWT,
+				JWTClaimPath: []string{"tenants"},
 			}
 			err := validateAndNormalizeJWTCustomSetting(&cs)
 			assert.NoError(t, err)
@@ -656,7 +659,7 @@ func TestLoadSettings(t *testing.T) {
 				Setting:       "tenant",
 				Enforced:      true,
 				Source:        CustomSettingSourceJWT,
-				JWTClaim:      "tenants",
+				JWTClaimPath:  []string{"tenants"},
 				JWTHeaderName: "authorization",
 			}
 			err := validateAndNormalizeJWTCustomSetting(&cs)
@@ -669,7 +672,7 @@ func TestLoadSettings(t *testing.T) {
 				Setting:      "tenant",
 				Enforced:     true,
 				Source:       CustomSettingSourceJWT,
-				JWTClaim:     "a.b.c",
+				JWTClaimPath: []string{"a", "b", "c"},
 				JWTClaimJoin: "|",
 				JWTVerify:    "none",
 			}
@@ -680,14 +683,14 @@ func TestLoadSettings(t *testing.T) {
 
 		t.Run("happy path: verify=jwks with valid URL, issuer, audience", func(t *testing.T) {
 			cs := CustomSetting{
-				Setting:    "tenant",
-				Enforced:   true,
-				Source:     CustomSettingSourceJWT,
-				JWTClaim:   "tenants",
-				JWTVerify:  "jwks",
-				JWTJWKSURL: "https://issuer.example/keys",
-				JWTIssuer:  "x",
-				JWTAudience: "y",
+				Setting:      "tenant",
+				Enforced:     true,
+				Source:       CustomSettingSourceJWT,
+				JWTClaimPath: []string{"tenants"},
+				JWTVerify:    "jwks",
+				JWTJWKSURL:   "https://issuer.example/keys",
+				JWTIssuer:    "x",
+				JWTAudience:  "y",
 			}
 			err := validateAndNormalizeJWTCustomSetting(&cs)
 			assert.NoError(t, err)
@@ -698,7 +701,7 @@ func TestLoadSettings(t *testing.T) {
 
 		t.Run("rejection: source=jwt without enforced=true", func(t *testing.T) {
 			_, err := LoadSettings(ctx, backend.DataSourceInstanceSettings{
-				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "source": "jwt", "jwtClaim": "tenants"}]}`),
+				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "source": "jwt", "jwtClaimPath": ["tenants"]}]}`),
 				DecryptedSecureJSONData: map[string]string{},
 			})
 			assert.Error(t, err)
@@ -707,7 +710,7 @@ func TestLoadSettings(t *testing.T) {
 
 		t.Run("rejection: source=jwt with value set", func(t *testing.T) {
 			_, err := LoadSettings(ctx, backend.DataSourceInstanceSettings{
-				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt", "jwtClaim": "tenants", "value": "fallback"}]}`),
+				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt", "jwtClaimPath": ["tenants"], "value": "fallback"}]}`),
 				DecryptedSecureJSONData: map[string]string{},
 			})
 			assert.Error(t, err)
@@ -718,7 +721,7 @@ func TestLoadSettings(t *testing.T) {
 			for _, name := range []string{"readonly", "READONLY", "ReadOnly"} {
 				name := name
 				t.Run(name, func(t *testing.T) {
-					jsonData := fmt.Sprintf(`{"host": "foo", "port": 443, "customSettings": [{"setting": %q, "enforced": true, "source": "jwt", "jwtClaim": "tenants"}]}`, name)
+					jsonData := fmt.Sprintf(`{"host": "foo", "port": 443, "customSettings": [{"setting": %q, "enforced": true, "source": "jwt", "jwtClaimPath": ["tenants"]}]}`, name)
 					_, err := LoadSettings(ctx, backend.DataSourceInstanceSettings{
 						JSONData:                []byte(jsonData),
 						DecryptedSecureJSONData: map[string]string{},
@@ -729,27 +732,46 @@ func TestLoadSettings(t *testing.T) {
 			}
 		})
 
-		t.Run("rejection: jwtClaim empty", func(t *testing.T) {
+		t.Run("rejection: jwtClaimPath missing", func(t *testing.T) {
 			_, err := LoadSettings(ctx, backend.DataSourceInstanceSettings{
 				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt"}]}`),
 				DecryptedSecureJSONData: map[string]string{},
 			})
 			assert.Error(t, err)
-			assert.Contains(t, err.Error(), "jwtClaim")
+			assert.Contains(t, err.Error(), "jwtClaimPath")
 		})
 
-		t.Run("rejection: jwtClaim containing ..", func(t *testing.T) {
+		t.Run("rejection: jwtClaimPath empty array", func(t *testing.T) {
 			_, err := LoadSettings(ctx, backend.DataSourceInstanceSettings{
-				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt", "jwtClaim": "a..b"}]}`),
+				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt", "jwtClaimPath": []}]}`),
 				DecryptedSecureJSONData: map[string]string{},
 			})
 			assert.Error(t, err)
-			assert.Contains(t, err.Error(), "consecutive dots")
+			assert.Contains(t, err.Error(), "jwtClaimPath")
+		})
+
+		t.Run("rejection: jwtClaimPath empty segment", func(t *testing.T) {
+			_, err := LoadSettings(ctx, backend.DataSourceInstanceSettings{
+				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt", "jwtClaimPath": [""]}]}`),
+				DecryptedSecureJSONData: map[string]string{},
+			})
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), "empty path segments")
+		})
+
+		t.Run("happy path: jwtClaimPath URI-namespaced segment accepted", func(t *testing.T) {
+			got, err := LoadSettings(ctx, backend.DataSourceInstanceSettings{
+				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt", "jwtClaimPath": ["https://x.example.com/y"]}]}`),
+				DecryptedSecureJSONData: map[string]string{},
+			})
+			require.NoError(t, err)
+			require.Len(t, got.CustomSettings, 1)
+			assert.Equal(t, []string{"https://x.example.com/y"}, got.CustomSettings[0].JWTClaimPath)
 		})
 
 		t.Run("rejection: unknown jwtVerify", func(t *testing.T) {
 			_, err := LoadSettings(ctx, backend.DataSourceInstanceSettings{
-				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt", "jwtClaim": "tenants", "jwtVerify": "magic"}]}`),
+				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt", "jwtClaimPath": ["tenants"], "jwtVerify": "magic"}]}`),
 				DecryptedSecureJSONData: map[string]string{},
 			})
 			assert.Error(t, err)
@@ -758,7 +780,7 @@ func TestLoadSettings(t *testing.T) {
 
 		t.Run("rejection: verify=jwks with empty URL", func(t *testing.T) {
 			_, err := LoadSettings(ctx, backend.DataSourceInstanceSettings{
-				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt", "jwtClaim": "tenants", "jwtVerify": "jwks"}]}`),
+				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt", "jwtClaimPath": ["tenants"], "jwtVerify": "jwks"}]}`),
 				DecryptedSecureJSONData: map[string]string{},
 			})
 			assert.Error(t, err)
@@ -767,7 +789,7 @@ func TestLoadSettings(t *testing.T) {
 
 		t.Run("rejection: verify=jwks with http URL", func(t *testing.T) {
 			_, err := LoadSettings(ctx, backend.DataSourceInstanceSettings{
-				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt", "jwtClaim": "tenants", "jwtVerify": "jwks", "jwtJwksUrl": "http://issuer.example/keys"}]}`),
+				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt", "jwtClaimPath": ["tenants"], "jwtVerify": "jwks", "jwtJwksUrl": "http://issuer.example/keys"}]}`),
 				DecryptedSecureJSONData: map[string]string{},
 			})
 			assert.Error(t, err)
@@ -777,12 +799,12 @@ func TestLoadSettings(t *testing.T) {
 		t.Run("rejection: verify=jwks with unparseable URL", func(t *testing.T) {
 			// \x00 (null byte) makes url.Parse return an error.
 			cs := CustomSetting{
-				Setting:    "s1",
-				Enforced:   true,
-				Source:     CustomSettingSourceJWT,
-				JWTClaim:   "tenants",
-				JWTVerify:  "jwks",
-				JWTJWKSURL: "https://issuer.example/\x00keys",
+				Setting:      "s1",
+				Enforced:     true,
+				Source:       CustomSettingSourceJWT,
+				JWTClaimPath: []string{"tenants"},
+				JWTVerify:    "jwks",
+				JWTJWKSURL:   "https://issuer.example/\x00keys",
 			}
 			err := validateAndNormalizeJWTCustomSetting(&cs)
 			assert.Error(t, err)
@@ -791,7 +813,7 @@ func TestLoadSettings(t *testing.T) {
 
 		t.Run("rejection: verify=none with jwtJwksUrl set", func(t *testing.T) {
 			_, err := LoadSettings(ctx, backend.DataSourceInstanceSettings{
-				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt", "jwtClaim": "tenants", "jwtJwksUrl": "https://issuer.example/keys"}]}`),
+				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt", "jwtClaimPath": ["tenants"], "jwtJwksUrl": "https://issuer.example/keys"}]}`),
 				DecryptedSecureJSONData: map[string]string{},
 			})
 			assert.Error(t, err)
@@ -801,7 +823,7 @@ func TestLoadSettings(t *testing.T) {
 
 		t.Run("rejection: verify=none with jwtIssuer set", func(t *testing.T) {
 			_, err := LoadSettings(ctx, backend.DataSourceInstanceSettings{
-				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt", "jwtClaim": "tenants", "jwtIssuer": "issuer.example"}]}`),
+				JSONData:                []byte(`{"host": "foo", "port": 443, "customSettings": [{"setting": "s1", "enforced": true, "source": "jwt", "jwtClaimPath": ["tenants"], "jwtIssuer": "issuer.example"}]}`),
 				DecryptedSecureJSONData: map[string]string{},
 			})
 			assert.Error(t, err)
@@ -811,13 +833,13 @@ func TestLoadSettings(t *testing.T) {
 
 		t.Run("rejection: whitespace-padded jwtIssuer", func(t *testing.T) {
 			cs := CustomSetting{
-				Setting:    "s1",
-				Enforced:   true,
-				Source:     CustomSettingSourceJWT,
-				JWTClaim:   "tenants",
-				JWTVerify:  "jwks",
-				JWTJWKSURL: "https://issuer.example/keys",
-				JWTIssuer:  " issuer.example ",
+				Setting:      "s1",
+				Enforced:     true,
+				Source:       CustomSettingSourceJWT,
+				JWTClaimPath: []string{"tenants"},
+				JWTVerify:    "jwks",
+				JWTJWKSURL:   "https://issuer.example/keys",
+				JWTIssuer:    " issuer.example ",
 			}
 			err := validateAndNormalizeJWTCustomSetting(&cs)
 			assert.Error(t, err)
@@ -826,10 +848,10 @@ func TestLoadSettings(t *testing.T) {
 
 		t.Run("defaulting: empty header, join, verify", func(t *testing.T) {
 			cs := CustomSetting{
-				Setting:  "tenant",
-				Enforced: true,
-				Source:   CustomSettingSourceJWT,
-				JWTClaim: "tenants",
+				Setting:      "tenant",
+				Enforced:     true,
+				Source:       CustomSettingSourceJWT,
+				JWTClaimPath: []string{"tenants"},
 				// JWTHeaderName, JWTClaimJoin, JWTVerify all empty → should be defaulted
 			}
 			err := validateAndNormalizeJWTCustomSetting(&cs)
@@ -848,7 +870,7 @@ func TestLoadSettings(t *testing.T) {
 						Setting:       "tenant",
 						Enforced:      true,
 						Source:        CustomSettingSourceJWT,
-						JWTClaim:      "tenants",
+						JWTClaimPath:  []string{"tenants"},
 						JWTHeaderName: "X-Grafana-Id",
 						JWTClaimJoin:  ",",
 						JWTVerify:     "none",
@@ -871,7 +893,7 @@ func TestLoadSettings(t *testing.T) {
 						Setting:       "tenant",
 						Enforced:      true,
 						Source:        CustomSettingSourceJWT,
-						JWTClaim:      "tenants",
+						JWTClaimPath:  []string{"tenants"},
 						JWTHeaderName: "X-Grafana-Id",
 						JWTClaimJoin:  ",",
 						JWTVerify:     "none",
@@ -882,6 +904,31 @@ func TestLoadSettings(t *testing.T) {
 			assert.Nil(t, s.enforcedSettings(), "dynamic-source entries must be excluded from static map")
 		})
 	})
+}
+
+func TestValidateClickHouseSettingName(t *testing.T) {
+	for _, name := range []string{"custom_x", "_x", "max_threads"} {
+		t.Run("accept "+name, func(t *testing.T) {
+			assert.NoError(t, validateClickHouseSettingName(name))
+		})
+	}
+
+	for _, name := range []string{"bad'name", "bad name", "bad-name", "bad;name", "", "1bad"} {
+		t.Run("reject "+name, func(t *testing.T) {
+			err := validateClickHouseSettingName(name)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), fmt.Sprintf("%q", name))
+			assert.Contains(t, err.Error(), "^[A-Za-z_][A-Za-z0-9_]*$")
+		})
+	}
+}
+
+func TestLoadSettings_RejectsInvalidCustomSettingName(t *testing.T) {
+	_, err := LoadSettings(context.Background(), backend.DataSourceInstanceSettings{
+		JSONData: []byte(`{"host":"clickhouse","port":9000,"protocol":"native","customSettings":[{"setting":"bad-name","value":"x"}]}`),
+	})
+	require.Error(t, err)
+	assert.True(t, strings.Contains(err.Error(), "bad-name"), "error should mention the invalid setting name: %s", err)
 }
 
 func TestLoadSettingsOAuthPassThru(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -53,9 +54,9 @@ type Settings struct {
 	// they fall back to the configured username/password (service account).
 	// Health checks and schema introspection always fall back regardless of
 	// this setting, since no user token is ever available for them.
-	OAuthPassThruAllowFallback bool `json:"oauthPassThruAllowFallback,omitempty"`
-	CustomSettings        []CustomSetting   `json:"customSettings"`
-	ProxyOptions          *proxy.Options
+	OAuthPassThruAllowFallback bool            `json:"oauthPassThruAllowFallback,omitempty"`
+	CustomSettings             []CustomSetting `json:"customSettings"`
+	ProxyOptions               *proxy.Options
 
 	RowLimit       int64 `json:"rowLimit,omitempty"`
 	EnableRowLimit bool  `json:"enableRowLimit,omitempty"`
@@ -105,13 +106,13 @@ type CustomSetting struct {
 	OnMissing string `json:"onMissing,omitempty"`
 
 	// JWT-source fields — only meaningful when Source == "jwt".
-	JWTHeaderName string `json:"jwtHeaderName,omitempty"` // default "X-Grafana-Id"
-	JWTClaim      string `json:"jwtClaim,omitempty"`      // dotted path, e.g. "tenants" or "a.b.c"
-	JWTClaimJoin  string `json:"jwtClaimJoin,omitempty"`  // separator for array claims; default ","
-	JWTVerify     string `json:"jwtVerify,omitempty"`     // "none" (default) | "jwks"
-	JWTJWKSURL    string `json:"jwtJwksUrl,omitempty"`    // required iff JWTVerify == "jwks"
-	JWTIssuer     string `json:"jwtIssuer,omitempty"`     // optional iss check (jwks only)
-	JWTAudience   string `json:"jwtAudience,omitempty"`   // optional aud check (jwks only)
+	JWTHeaderName string   `json:"jwtHeaderName,omitempty"` // default "X-Grafana-Id"
+	JWTClaimPath  []string `json:"jwtClaimPath,omitempty"`  // claim key path; each element is one literal JSON key, e.g. ["https://myapp.example.com/roles"] or ["realm_access","roles"]
+	JWTClaimJoin  string   `json:"jwtClaimJoin,omitempty"`  // separator for array claims; default ","
+	JWTVerify     string   `json:"jwtVerify,omitempty"`     // "none" (default) | "jwks"
+	JWTJWKSURL    string   `json:"jwtJwksUrl,omitempty"`    // required iff JWTVerify == "jwks"
+	JWTIssuer     string   `json:"jwtIssuer,omitempty"`     // optional iss check (jwks only)
+	JWTAudience   string   `json:"jwtAudience,omitempty"`   // optional aud check (jwks only)
 }
 
 const (
@@ -133,6 +134,15 @@ const (
 )
 
 const secureHeaderKeyPrefix = "secureHttpHeaders."
+
+var clickHouseSettingNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func validateClickHouseSettingName(name string) error {
+	if !clickHouseSettingNameRE.MatchString(name) {
+		return fmt.Errorf("invalid ClickHouse setting name %q: allowed grammar is ^[A-Za-z_][A-Za-z0-9_]*$", name)
+	}
+	return nil
+}
 
 func (settings *Settings) isValid() (err error) {
 	if settings.Host == "" {
@@ -366,8 +376,13 @@ func LoadSettings(ctx context.Context, config backend.DataSourceInstanceSettings
 			if v, ok := rawMap["jwtHeaderName"].(string); ok {
 				cs.JWTHeaderName = v
 			}
-			if v, ok := rawMap["jwtClaim"].(string); ok {
-				cs.JWTClaim = v
+			if raw, ok := rawMap["jwtClaimPath"].([]interface{}); ok {
+				cs.JWTClaimPath = make([]string, 0, len(raw))
+				for _, elem := range raw {
+					if v, ok := elem.(string); ok {
+						cs.JWTClaimPath = append(cs.JWTClaimPath, v)
+					}
+				}
 			}
 			if v, ok := rawMap["jwtClaimJoin"].(string); ok {
 				cs.JWTClaimJoin = v
@@ -463,6 +478,9 @@ func LoadSettings(ctx context.Context, config backend.DataSourceInstanceSettings
 	// factory is wired up).
 	for i := range settings.CustomSettings {
 		cs := &settings.CustomSettings[i]
+		if err := validateClickHouseSettingName(cs.Setting); err != nil {
+			return settings, backend.DownstreamError(err)
+		}
 		if cs.Source != CustomSettingSourceJWT {
 			continue
 		}
@@ -621,12 +639,12 @@ func validateAndNormalizeJWTCustomSetting(cs *CustomSetting) error {
 		return fmt.Errorf("source=jwt must not bind to reserved setting %q", cs.Setting)
 	}
 
-	// jwtClaim is required and must be a valid dotted path.
-	if cs.JWTClaim == "" {
-		return fmt.Errorf("source=jwt requires non-empty jwtClaim for setting %q", cs.Setting)
+	// jwtClaimPath is required and must contain literal claim key segments.
+	if len(cs.JWTClaimPath) == 0 {
+		return fmt.Errorf("source=jwt requires non-empty jwtClaimPath for setting %q", cs.Setting)
 	}
-	if err := validateJWTClaimPath(cs.JWTClaim); err != nil {
-		return fmt.Errorf("invalid jwtClaim for setting %q: %w", cs.Setting, err)
+	if err := validateJWTClaimPath(cs.JWTClaimPath); err != nil {
+		return fmt.Errorf("invalid jwtClaimPath for setting %q: %w", cs.Setting, err)
 	}
 
 	// Normalise jwtHeaderName: empty → default, then canonicalise via http.CanonicalHeaderKey.
@@ -690,17 +708,12 @@ func validateAndNormalizeJWTCustomSetting(cs *CustomSetting) error {
 	return nil
 }
 
-// validateJWTClaimPath validates a dotted claim path. Empty segments, leading/
-// trailing dots, and consecutive dots are all rejected to prevent ambiguous
-// path resolution.
-func validateJWTClaimPath(path string) error {
-	if strings.HasPrefix(path, ".") || strings.HasSuffix(path, ".") {
-		return fmt.Errorf("must not have leading or trailing dots")
+// validateJWTClaimPath validates literal claim path segments.
+func validateJWTClaimPath(path []string) error {
+	if len(path) == 0 {
+		return fmt.Errorf("must not be empty")
 	}
-	if strings.Contains(path, "..") {
-		return fmt.Errorf("must not contain consecutive dots (..)")
-	}
-	for _, seg := range strings.Split(path, ".") {
+	for _, seg := range path {
 		if seg == "" {
 			return fmt.Errorf("must not contain empty path segments")
 		}
