@@ -6,18 +6,17 @@ import { createTestProps } from './helpers';
 import { CHCustomSetting, Protocol } from 'types/config';
 
 /**
- * These tests document a v1 → v2 round-trip contract for `customSettings`.
+ * These tests document a v1 → v2 round-trip contract for `customSettings`
+ * plus v2's own interaction contract for enforced / header-sourced /
+ * JWT-sourced enforced settings.
  *
- * BLOCKER: The v2 editor does not yet render UI for the enforcement fields
- * (`enforced`, `source`, `headerName`, `onMissing`, `jwt*`). The v2 config UI
- * is the current Grafana default (`newClickhouseConfigPageDesign` is GA /
- * default-on in Grafana core's feature registry), so the v1-only controls are
- * invisible to essentially all users. Reaching v2 parity for enforced /
- * header-sourced / JWT-sourced settings is a merge blocker for upstreaming
- * this work.
+ * v2 renders a compact base row (Setting / Value / Enforced / Source) plus
+ * an on-demand Advanced panel for header- and JWT-source fields. Shared
+ * label strings live in src/labels.ts and shared selectors under
+ * selectors.components.Config.CustomSettingsConfig.*.
  *
- * Until the v2 UI lands, a datasource provisioned or edited in v1 with those
- * fields set must at minimum survive being edited in v2. Concretely:
+ * A datasource provisioned or edited in v1 with enforcement fields set must
+ * survive being edited in v2:
  *
  *   1. Editing the Setting or Value cell of an enforced row in v2 must NOT
  *      drop the enforcement metadata for that row.
@@ -170,11 +169,8 @@ describe('AdditionalSettingsSection — custom settings round-trip', () => {
 
     render(<AdditionalSettingsSection {...props} />);
 
-    const settingInput = screen.getByDisplayValue('tenant_id') as HTMLInputElement;
-    const row = settingInput.closest('div[class*="css-"], .css-1qsu73n') ?? settingInput.parentElement?.parentElement;
-    // Locate the Value input in the same row via its placeholder.
-    const valueInput = screen.getByPlaceholderText(/Managed by v1 enforcement/i) as HTMLInputElement;
-    expect(row).toBeTruthy();
+    // Locate the disabled Value input in the header-sourced row via its placeholder.
+    const valueInput = screen.getByPlaceholderText(/\(from header\)/i) as HTMLInputElement;
     expect(valueInput.disabled).toBe(true);
   });
 
@@ -197,5 +193,102 @@ describe('AdditionalSettingsSection — custom settings round-trip', () => {
       onOptionsChange.mock.calls[onOptionsChange.mock.calls.length - 1][0].jsonData.customSettings;
 
     expect(savedCustomSettings).toEqual([{ setting: 'kept', value: 'v2' }]);
+  });
+
+  it('shows the header-warning banner when a row has source=header', () => {
+    const initial: CHCustomSetting[] = [
+      {
+        setting: 'tenant_id',
+        value: '',
+        enforced: true,
+        source: 'header',
+        headerName: 'X-Tenant-Id',
+        onMissing: 'reject',
+      },
+    ];
+    const { props } = buildProps(initial);
+    render(<AdditionalSettingsSection {...props} />);
+    expect(screen.getByText(/require a trusted upstream proxy/i)).toBeTruthy();
+  });
+
+  it('shows the JWT info banner when a row has source=jwt', () => {
+    const initial: CHCustomSetting[] = [
+      {
+        setting: 'user_roles',
+        value: '',
+        enforced: true,
+        source: 'jwt',
+        onMissing: 'reject',
+        jwtClaimPath: ['roles'],
+      },
+    ];
+    const { props } = buildProps(initial);
+    render(<AdditionalSettingsSection {...props} />);
+    // The JWT info-banner title comes from shared labels: "JWT-claim source".
+    expect(screen.getByText(/JWT-claim source/i)).toBeTruthy();
+  });
+
+  it('auto-expands the advanced panel for a row loaded with a non-static source', () => {
+    const initial: CHCustomSetting[] = [
+      {
+        setting: 'tenant_id',
+        value: '',
+        enforced: true,
+        source: 'header',
+        headerName: 'X-Tenant-Id',
+        onMissing: 'reject',
+      },
+    ];
+    const { props } = buildProps(initial);
+    render(<AdditionalSettingsSection {...props} />);
+    // Advanced-panel HeaderName input should be present without any interaction.
+    const headerNameInput = screen.getByDisplayValue('X-Tenant-Id') as HTMLInputElement;
+    expect(headerNameInput).toBeTruthy();
+  });
+
+  it('auto-locks the Enforce read-only master toggle when any row is enforced', () => {
+    const initial: CHCustomSetting[] = [
+      {
+        setting: 'max_rows_to_read',
+        value: '1000',
+        enforced: true,
+        source: 'static',
+      },
+    ];
+    const { props } = buildProps(initial);
+    const { container } = render(<AdditionalSettingsSection {...props} />);
+    const label = screen.getByText('Enforce read-only on all queries');
+    // Locate the Switch by walking up from the label to the enclosing Field wrapper,
+    // then finding the switch input within it.
+    let node: HTMLElement | null = label;
+    let toggle: HTMLInputElement | null = null;
+    while (node && node !== container) {
+      toggle = node.querySelector('input[type="checkbox"]') as HTMLInputElement | null;
+      if (toggle) {
+        break;
+      }
+      node = node.parentElement;
+    }
+    expect(toggle).toBeTruthy();
+    expect(toggle!.checked).toBe(true);
+    expect(toggle!.disabled).toBe(true);
+  });
+
+  it('leaves the Enforce read-only master toggle editable when no row is enforced', () => {
+    const initial: CHCustomSetting[] = [{ setting: 'foo', value: 'bar' }];
+    const { props } = buildProps(initial);
+    const { container } = render(<AdditionalSettingsSection {...props} />);
+    const label = screen.getByText('Enforce read-only on all queries');
+    let node: HTMLElement | null = label;
+    let toggle: HTMLInputElement | null = null;
+    while (node && node !== container) {
+      toggle = node.querySelector('input[type="checkbox"]') as HTMLInputElement | null;
+      if (toggle) {
+        break;
+      }
+      node = node.parentElement;
+    }
+    expect(toggle).toBeTruthy();
+    expect(toggle!.disabled).toBe(false);
   });
 });

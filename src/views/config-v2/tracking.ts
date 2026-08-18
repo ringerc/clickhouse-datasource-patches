@@ -127,3 +127,19 @@ export const trackClickhouseConfigV2EnableRowLimitToggle = (props: { rowLimitEna
 export const trackClickhouseConfigV2CustomSettingClicked = () => {
   reportInteraction('clickhouse_config_v2_custom_setting_clicked');
 };
+
+export const trackClickhouseConfigV2CustomSettingEnforcedToggle = (props: { enforced: boolean }) => {
+  reportInteraction('clickhouse_config_v2_custom_setting_enforced_toggle', props);
+};
+
+export const trackClickhouseConfigV2CustomSettingSourceChanged = (props: { source: string }) => {
+  reportInteraction('clickhouse_config_v2_custom_setting_source_changed', props);
+};
+
+export const trackClickhouseConfigV2CustomSettingRowExpanded = (props: { expanded: boolean }) => {
+  reportInteraction('clickhouse_config_v2_custom_setting_row_expanded', props);
+};
+
+export const trackClickhouseConfigV2EnforceReadOnlyToggle = (props: { enforceReadOnly: boolean }) => {
+  reportInteraction('clickhouse_config_v2_enforce_read_only_toggle', props);
+};
