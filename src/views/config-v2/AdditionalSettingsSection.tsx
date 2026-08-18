@@ -116,7 +116,17 @@ export const AdditionalSettingsSection = (props: Props) => {
       ...options,
       jsonData: {
         ...options.jsonData,
-        customSettings: customSettings.filter((s) => !!s.setting && !!s.value),
+        customSettings: customSettings.filter(
+          (s) =>
+            !!s.setting &&
+            (!!s.value ||
+              (s.enforced && s.source === 'header' && !!s.headerName) ||
+              (s.enforced &&
+                s.source === 'jwt' &&
+                Array.isArray(s.jwtClaimPath) &&
+                s.jwtClaimPath.length > 0 &&
+                !!s.jwtClaimPath[0]))
+        ),
       },
     });
   };
@@ -300,14 +310,23 @@ export const AdditionalSettingsSection = (props: Props) => {
         )}
         <ConfigSubSection title="Custom Settings">
           {/*
-           * NOTE: The v2 editor does not yet support the `enforced` field or the new
-           * `source`, `headerName`, `onMissing`, and JWT-source fields (`jwtClaimPath`,
+           * NOTE: The v2 editor does not yet render UI for the `enforced` field or the
+           * new `source`, `headerName`, `onMissing`, and JWT-source fields (`jwtClaimPath`,
            * `jwtHeaderName`, `jwtClaimJoin`, `jwtVerify`, `jwtJwksUrl`, `jwtIssuer`,
            * `jwtAudience`) introduced for header-sourced and JWT-sourced enforced
            * settings. For the full enforcement UI (including header and JWT sources),
            * see the v1 implementation in src/views/CHConfigEditor.tsx.
+           *
+           * The row spreads below intentionally preserve every existing field via
+           * `...customSettings[i]` so that a datasource provisioned (or edited) in v1
+           * with enforcement metadata round-trips cleanly through v2: editing the
+           * Setting or Value in v2 will not silently drop `enforced`, `source`,
+           * `headerName`, `onMissing`, or any `jwt*` field. The `onCustomSettingsChange`
+           * save filter above mirrors the v1 filter so header/JWT rows (which store
+           * `value: ''` by design) survive persistence.
            */}
-          {customSettings.map(({ setting, value }, i) => {
+          {customSettings.map(({ setting, value, enforced, source }, i) => {
+            const isDynamicEnforced = !!enforced && !!source && source !== 'static';
             return (
               <Stack key={i} direction="row">
                 <Field label={`Setting`} aria-label={`Setting`}>
@@ -316,7 +335,7 @@ export const AdditionalSettingsSection = (props: Props) => {
                     placeholder={'Setting'}
                     onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
                       let newSettings = customSettings.concat();
-                      newSettings[i] = { setting: changeEvent.target.value, value };
+                      newSettings[i] = { ...customSettings[i], setting: changeEvent.target.value };
                       setCustomSettings(newSettings);
                     }}
                     onBlur={() => onCustomSettingsChange(customSettings)}
@@ -325,10 +344,11 @@ export const AdditionalSettingsSection = (props: Props) => {
                 <Field label={'Value'} aria-label={`Value`}>
                   <Input
                     value={value}
-                    placeholder={'Value'}
+                    placeholder={isDynamicEnforced ? 'Managed by v1 enforcement (edit in v1)' : 'Value'}
+                    disabled={isDynamicEnforced}
                     onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
                       let newSettings = customSettings.concat();
-                      newSettings[i] = { setting, value: changeEvent.target.value };
+                      newSettings[i] = { ...customSettings[i], value: changeEvent.target.value };
                       setCustomSettings(newSettings);
                     }}
                     onBlur={() => {
@@ -336,6 +356,11 @@ export const AdditionalSettingsSection = (props: Props) => {
                     }}
                   ></Input>
                 </Field>
+                {enforced && (
+                  <Field label="Enforced" aria-label="Enforced">
+                    <Badge text={source && source !== 'static' ? `enforced · ${source}` : 'enforced'} color="blue" />
+                  </Field>
+                )}
               </Stack>
             );
           })}
