@@ -4,6 +4,10 @@ import { render, fireEvent, screen } from '@testing-library/react';
 import { AdditionalSettingsSection } from './AdditionalSettingsSection';
 import { createTestProps } from './helpers';
 import { CHCustomSetting, Protocol } from 'types/config';
+import { selectors } from '../../selectors';
+import * as tracking from './tracking';
+
+jest.mock('./tracking');
 
 /**
  * These tests document a v1 → v2 round-trip contract for `customSettings`
@@ -290,5 +294,273 @@ describe('AdditionalSettingsSection — custom settings round-trip', () => {
     }
     expect(toggle).toBeTruthy();
     expect(toggle!.disabled).toBe(false);
+  });
+
+  // Helpers scoped to the interaction-tests block below.
+  const cs = selectors.components.Config.CustomSettingsConfig;
+
+  const findMasterEnforceReadOnlyToggle = (container: HTMLElement): HTMLInputElement => {
+    const label = screen.getByText('Enforce read-only on all queries');
+    let node: HTMLElement | null = label;
+    while (node && node !== container) {
+      const t = node.querySelector('input[type="checkbox"]') as HTMLInputElement | null;
+      if (t) {
+        return t;
+      }
+      node = node.parentElement;
+    }
+    throw new Error('Master Enforce read-only toggle not found');
+  };
+
+  const findRowEnforcedCheckbox = (): HTMLInputElement => {
+    // The row's Enforced Checkbox carries a stable test-id from the shared
+    // selectors constant. Prefer this over DOM-walking anchors that break
+    // when Grafana UI internals change.
+    const wrapper = screen.getByTestId(cs.enforcedCheckbox);
+    // Some Grafana UI Checkbox versions render the input as the test-id
+    // target; others wrap it in a <label>. Handle both.
+    if (wrapper instanceof HTMLInputElement) {
+      return wrapper;
+    }
+    const input = wrapper.querySelector('input[type="checkbox"]') as HTMLInputElement | null;
+    if (!input) {
+      throw new Error('Row-level Enforced checkbox input not found');
+    }
+    return input;
+  };
+
+  // -- source-transition + edit-persistence tests -----------------------------
+
+  it('renders JWT-source fields for a jwt row (no jwks fields when verify=none)', () => {
+    const initial: CHCustomSetting[] = [
+      {
+        setting: 'roles',
+        value: '',
+        enforced: true,
+        source: 'jwt',
+        jwtHeaderName: 'X-Id-Token',
+        jwtClaimPath: ['roles'],
+        jwtVerify: 'none',
+      },
+    ];
+    const { props } = buildProps(initial);
+    render(<AdditionalSettingsSection {...props} />);
+    expect(screen.getByTestId(cs.jwtTokenHeaderInput)).toBeInTheDocument();
+    expect(screen.getByTestId(cs.jwtClaimPathInput)).toBeInTheDocument();
+    expect(screen.getByTestId(cs.jwtArrayJoinInput)).toBeInTheDocument();
+    expect(screen.getByTestId(cs.jwtVerifySelect)).toBeInTheDocument();
+    expect(screen.queryByTestId(cs.jwtJwksUrlInput)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(cs.jwtIssuerInput)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(cs.jwtAudienceInput)).not.toBeInTheDocument();
+    // Header-specific fields must NOT be present on a jwt row.
+    expect(screen.queryByTestId(cs.headerNameInput)).not.toBeInTheDocument();
+  });
+
+  it('renders JWKS URL/Issuer/Audience when verify=jwks', () => {
+    const initial: CHCustomSetting[] = [
+      {
+        setting: 'roles',
+        value: '',
+        enforced: true,
+        source: 'jwt',
+        jwtClaimPath: ['roles'],
+        jwtVerify: 'jwks',
+        jwtJwksUrl: 'https://idp.example/jwks.json',
+        jwtIssuer: 'https://idp.example/',
+        jwtAudience: 'grafana',
+      },
+    ];
+    const { props } = buildProps(initial);
+    render(<AdditionalSettingsSection {...props} />);
+    expect(screen.getByTestId(cs.jwtJwksUrlInput)).toHaveValue('https://idp.example/jwks.json');
+    expect(screen.getByTestId(cs.jwtIssuerInput)).toHaveValue('https://idp.example/');
+    expect(screen.getByTestId(cs.jwtAudienceInput)).toHaveValue('grafana');
+  });
+
+  it('does not render header/JWT fields on a static-source enforced row', () => {
+    const initial: CHCustomSetting[] = [
+      { setting: 'max_rows_to_read', value: '1000', enforced: true, source: 'static' },
+    ];
+    const { props } = buildProps(initial);
+    render(<AdditionalSettingsSection {...props} />);
+    expect(screen.queryByTestId(cs.headerNameInput)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(cs.jwtTokenHeaderInput)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(cs.jwtVerifySelect)).not.toBeInTheDocument();
+    // Editable Value input must be present for a static row.
+    expect(screen.getByDisplayValue('1000')).toBeInTheDocument();
+  });
+
+  it('persists HeaderName edits on blur', () => {
+    const initial: CHCustomSetting[] = [
+      {
+        setting: 'tenant_id',
+        value: '',
+        enforced: true,
+        source: 'header',
+        headerName: 'X-Tenant-Id',
+        onMissing: 'reject',
+      },
+    ];
+    const { props, onOptionsChange } = buildProps(initial);
+    render(<AdditionalSettingsSection {...props} />);
+
+    const headerNameInput = screen.getByTestId(cs.headerNameInput) as HTMLInputElement;
+    fireEvent.change(headerNameInput, { target: { value: 'X-New-Tenant-Id' } });
+    fireEvent.blur(headerNameInput);
+
+    const saved: CHCustomSetting[] =
+      onOptionsChange.mock.calls[onOptionsChange.mock.calls.length - 1][0].jsonData.customSettings;
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({
+      setting: 'tenant_id',
+      value: '',
+      enforced: true,
+      source: 'header',
+      headerName: 'X-New-Tenant-Id',
+      onMissing: 'reject',
+    });
+  });
+
+  it('persists JWT claim path as a single-element array on blur', () => {
+    const initial: CHCustomSetting[] = [
+      {
+        setting: 'roles',
+        value: '',
+        enforced: true,
+        source: 'jwt',
+        jwtHeaderName: 'X-Id-Token',
+        jwtClaimPath: ['roles'],
+      },
+    ];
+    const { props, onOptionsChange } = buildProps(initial);
+    render(<AdditionalSettingsSection {...props} />);
+
+    const claimInput = screen.getByTestId(cs.jwtClaimPathInput) as HTMLInputElement;
+    fireEvent.change(claimInput, { target: { value: 'tenants' } });
+    fireEvent.blur(claimInput);
+
+    const saved: CHCustomSetting[] =
+      onOptionsChange.mock.calls[onOptionsChange.mock.calls.length - 1][0].jsonData.customSettings;
+    expect(saved[0].jwtClaimPath).toEqual(['tenants']);
+  });
+
+  it('persists JWKS URL edits on blur', () => {
+    const initial: CHCustomSetting[] = [
+      {
+        setting: 'roles',
+        value: '',
+        enforced: true,
+        source: 'jwt',
+        jwtClaimPath: ['roles'],
+        jwtVerify: 'jwks',
+        jwtJwksUrl: 'https://old.example/jwks.json',
+      },
+    ];
+    const { props, onOptionsChange } = buildProps(initial);
+    render(<AdditionalSettingsSection {...props} />);
+
+    const jwksInput = screen.getByTestId(cs.jwtJwksUrlInput) as HTMLInputElement;
+    fireEvent.change(jwksInput, { target: { value: 'https://new.example/jwks.json' } });
+    fireEvent.blur(jwksInput);
+
+    const saved: CHCustomSetting[] =
+      onOptionsChange.mock.calls[onOptionsChange.mock.calls.length - 1][0].jsonData.customSettings;
+    expect(saved[0].jwtJwksUrl).toBe('https://new.example/jwks.json');
+    // jwtVerify must be preserved across the edit.
+    expect(saved[0].jwtVerify).toBe('jwks');
+  });
+
+  // -- Enforced-checkbox reveal ------------------------------------------------
+
+  it('toggling Enforced on an unenforced row reveals the Source select', () => {
+    const initial: CHCustomSetting[] = [{ setting: 'foo', value: 'bar' }];
+    const { props, onOptionsChange } = buildProps(initial);
+    render(<AdditionalSettingsSection {...props} />);
+
+    expect(screen.queryByTestId(cs.sourceSelect)).not.toBeInTheDocument();
+
+    onOptionsChange.mockClear();
+    fireEvent.click(findRowEnforcedCheckbox());
+
+    // Now the source select is visible, and the row was persisted as enforced.
+    expect(screen.getByTestId(cs.sourceSelect)).toBeInTheDocument();
+    // Find the call that mutated customSettings with an enforced row.
+    const enforcedCall = onOptionsChange.mock.calls.find(
+      (c: unknown[]) => (c[0] as { jsonData: { customSettings?: CHCustomSetting[] } }).jsonData.customSettings?.[0]?.enforced === true
+    );
+    expect(enforcedCall).toBeTruthy();
+  });
+
+  // -- Expand/collapse IconButton ---------------------------------------------
+
+  it('advanced panel can be collapsed via the toggle IconButton', () => {
+    const initial: CHCustomSetting[] = [
+      {
+        setting: 'tenant_id',
+        value: '',
+        enforced: true,
+        source: 'header',
+        headerName: 'X-Tenant-Id',
+        onMissing: 'reject',
+      },
+    ];
+    const { props } = buildProps(initial);
+    render(<AdditionalSettingsSection {...props} />);
+
+    // Panel starts expanded (auto-expand rule).
+    expect(screen.getByTestId(cs.headerNameInput)).toBeInTheDocument();
+
+    const toggleBtn = screen.getByLabelText(/Hide advanced settings/i);
+    fireEvent.click(toggleBtn);
+
+    // After collapse, the HeaderName input should no longer be rendered.
+    expect(screen.queryByTestId(cs.headerNameInput)).not.toBeInTheDocument();
+
+    // And the button label flips.
+    expect(screen.getByLabelText(/Show advanced settings/i)).toBeInTheDocument();
+  });
+
+  // -- Tracking events --------------------------------------------------------
+
+  it('fires v2 tracking on Enforced toggle', () => {
+    const initial: CHCustomSetting[] = [{ setting: 'foo', value: 'bar' }];
+    const { props } = buildProps(initial);
+    render(<AdditionalSettingsSection {...props} />);
+
+    fireEvent.click(findRowEnforcedCheckbox());
+
+    expect(tracking.trackClickhouseConfigV2CustomSettingEnforcedToggle as jest.Mock).toHaveBeenCalledWith({
+      enforced: true,
+    });
+  });
+
+  // -- Master Enforce read-only persistence -----------------------------------
+
+  it('toggling the master Enforce read-only Switch persists enforceReadOnly', () => {
+    const initial: CHCustomSetting[] = [{ setting: 'foo', value: 'bar' }];
+    const { props, onOptionsChange } = buildProps(initial);
+    const { container } = render(<AdditionalSettingsSection {...props} />);
+
+    const toggle = findMasterEnforceReadOnlyToggle(container);
+    expect(toggle.disabled).toBe(false);
+    expect(toggle.checked).toBe(false);
+    fireEvent.click(toggle);
+
+    const savedJsonData =
+      onOptionsChange.mock.calls[onOptionsChange.mock.calls.length - 1][0].jsonData;
+    expect(savedJsonData.enforceReadOnly).toBe(true);
+  });
+
+  it('fires v2 tracking on master Enforce read-only toggle', () => {
+    const initial: CHCustomSetting[] = [{ setting: 'foo', value: 'bar' }];
+    const { props } = buildProps(initial);
+    const { container } = render(<AdditionalSettingsSection {...props} />);
+
+    const toggle = findMasterEnforceReadOnlyToggle(container);
+    fireEvent.click(toggle);
+
+    expect(tracking.trackClickhouseConfigV2EnforceReadOnlyToggle as jest.Mock).toHaveBeenCalledWith({
+      enforceReadOnly: true,
+    });
   });
 });

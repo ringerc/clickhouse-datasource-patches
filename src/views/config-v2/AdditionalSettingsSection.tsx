@@ -463,6 +463,7 @@ export const AdditionalSettingsSection = (props: Props) => {
                   >
                     <Checkbox
                       value={enforced || false}
+                      data-testid={selectors.components.Config.CustomSettingsConfig.enforcedCheckbox}
                       onChange={(changeEvent: ChangeEvent<HTMLInputElement>) => {
                         const checked = changeEvent.target.checked;
                         const newSettings = customSettings.concat();

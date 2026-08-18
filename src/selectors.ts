@@ -125,6 +125,7 @@ export const Components = {
     },
     CustomSettingsConfig: {
       sourceSelect: 'config__custom-settings__source-select',
+      enforcedCheckbox: 'config__custom-settings__enforced-checkbox',
       headerNameInput: 'config__custom-settings__header-name-input',
       onMissingSelect: 'config__custom-settings__on-missing-select',
       headerWarningBanner: 'config__custom-settings__header-warning-banner',
