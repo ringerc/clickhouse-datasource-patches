@@ -8,10 +8,16 @@ import { CHCustomSetting, Protocol } from 'types/config';
 /**
  * These tests document a v1 → v2 round-trip contract for `customSettings`.
  *
- * The v2 editor does not (yet) render UI for the enforcement fields
- * (`enforced`, `source`, `headerName`, `onMissing`, `jwt*`), but a datasource
- * provisioned or edited in v1 with those fields set must survive being edited
- * in v2. Concretely:
+ * BLOCKER: The v2 editor does not yet render UI for the enforcement fields
+ * (`enforced`, `source`, `headerName`, `onMissing`, `jwt*`). The v2 config UI
+ * is the current Grafana default (`newClickhouseConfigPageDesign` is GA /
+ * default-on in Grafana core's feature registry), so the v1-only controls are
+ * invisible to essentially all users. Reaching v2 parity for enforced /
+ * header-sourced / JWT-sourced settings is a merge blocker for upstreaming
+ * this work.
+ *
+ * Until the v2 UI lands, a datasource provisioned or edited in v1 with those
+ * fields set must at minimum survive being edited in v2. Concretely:
  *
  *   1. Editing the Setting or Value cell of an enforced row in v2 must NOT
  *      drop the enforcement metadata for that row.

@@ -310,12 +310,18 @@ export const AdditionalSettingsSection = (props: Props) => {
         )}
         <ConfigSubSection title="Custom Settings">
           {/*
-           * NOTE: The v2 editor does not yet render UI for the `enforced` field or the
-           * new `source`, `headerName`, `onMissing`, and JWT-source fields (`jwtClaimPath`,
-           * `jwtHeaderName`, `jwtClaimJoin`, `jwtVerify`, `jwtJwksUrl`, `jwtIssuer`,
-           * `jwtAudience`) introduced for header-sourced and JWT-sourced enforced
-           * settings. For the full enforcement UI (including header and JWT sources),
-           * see the v1 implementation in src/views/CHConfigEditor.tsx.
+           * BLOCKER: The v2 editor does not yet render UI for the `enforced` field or
+           * the new `source`, `headerName`, `onMissing`, and JWT-source fields
+           * (`jwtClaimPath`, `jwtHeaderName`, `jwtClaimJoin`, `jwtVerify`, `jwtJwksUrl`,
+           * `jwtIssuer`, `jwtAudience`) introduced for header-sourced and JWT-sourced
+           * enforced settings. The full enforcement UI currently only exists in the v1
+           * editor at src/views/CHConfigEditor.tsx.
+           *
+           * The v2 config UI is the current Grafana default (feature flag
+           * `newClickhouseConfigPageDesign` is GA / default-on in Grafana core's
+           * feature registry), so the v1-only controls are invisible to essentially all
+           * users. Reaching parity here is a merge blocker for upstreaming the
+           * enforced-settings / header / JWT source work.
            *
            * The row spreads below intentionally preserve every existing field via
            * `...customSettings[i]` so that a datasource provisioned (or edited) in v1
