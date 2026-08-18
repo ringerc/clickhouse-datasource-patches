@@ -5,13 +5,19 @@ package plugin
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	clickhouse_sql "github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/data/sqlutil"
 	"github.com/stretchr/testify/assert"
@@ -52,6 +58,9 @@ func makeEnforcedDSSettings(t *testing.T, protocol clickhouse_sql.Protocol, enfo
 }
 
 // openEnforcedDB creates a *sql.DB via the Clickhouse plugin with the given DS settings.
+// The plugin is built with a live JWKS cache (as NewDatasource does), so JWT-sourced
+// bindings that use verify=jwks can resolve tokens end-to-end. The cache is closed
+// via t.Cleanup so its background refresh goroutines terminate with the test.
 func openEnforcedDB(t *testing.T, dsSettings backend.DataSourceInstanceSettings) (*Clickhouse, *sql.DB) {
 	t.Helper()
 	plugin := &Clickhouse{}
@@ -59,7 +68,12 @@ func openEnforcedDB(t *testing.T, dsSettings backend.DataSourceInstanceSettings)
 	require.NoError(t, err)
 	plugin.enforceReadOnly = s.EnforceReadOnly
 	plugin.enforcedStatic = buildEnforcedStaticChSettings(s)
-	bindings, bErr := s.enforcedBindings()
+
+	cache := newJWKSCache(newJWKSHTTPClient(s))
+	plugin.jwksCache = cache
+	t.Cleanup(cache.close)
+
+	bindings, bErr := s.enforcedBindingsWithRuntime(EnforcedSourceRuntime{JWKSCache: cache})
 	require.NoError(t, bErr)
 	plugin.enforcedBindings = bindings
 	for _, b := range bindings {
@@ -415,9 +429,24 @@ func TestEnforcedSettingsHeaderBinding_E2E(t *testing.T) {
 // JWT-sourced enforced settings integration test (needs live ClickHouse)
 // ---------------------------------------------------------------------------
 
+// jwtDSOpts configures makeJWTDSSettings for a given scenario.
+//
+// Only fields that vary per subtest are exposed; verify is always "jwks" and
+// jwtHeaderName is always "X-Token" (matched by jwtEnforcedCtx below).
+type jwtDSOpts struct {
+	settingName string
+	jwksURL     string
+	claimPath   []string // defaults to []string{"tenants"}
+	claimJoin   string   // defaults to "," (empty means "not set → server default")
+	onMissing   string   // "" | "reject" | "empty"
+	issuer      string   // optional expected iss
+	audience    string   // optional expected aud
+}
+
 // makeJWTDSSettings builds a backend.DataSourceInstanceSettings for a JWT-sourced
-// enforced setting. tokenServerURL is the ephemeral JWKS server URL; used as the JWKS URL.
-func makeJWTDSSettings(t *testing.T, protocol clickhouse_sql.Protocol, settingName, jwksURL string) backend.DataSourceInstanceSettings {
+// enforced setting. The JWKS URL points at an in-process httptest server; the
+// binding reads the JWT from the X-Token forwarded header.
+func makeJWTDSSettings(t *testing.T, protocol clickhouse_sql.Protocol, opts jwtDSOpts) backend.DataSourceInstanceSettings {
 	t.Helper()
 	port := getEnv("CLICKHOUSE_PORT", "9000")
 	if protocol == clickhouse_sql.HTTP {
@@ -431,17 +460,34 @@ func makeJWTDSSettings(t *testing.T, protocol clickhouse_sql.Protocol, settingNa
 		proto = "http"
 	}
 
-	csJSON, _ := json.Marshal([]map[string]interface{}{
-		{
-			"setting":       settingName,
-			"enforced":      true,
-			"source":        "jwt",
-			"jwtClaimPath":  []string{"tenants"},
-			"jwtHeaderName": "X-Token",
-			"jwtVerify":     "jwks",
-			"jwtJwksUrl":    jwksURL,
-		},
-	})
+	claimPath := opts.claimPath
+	if len(claimPath) == 0 {
+		claimPath = []string{"tenants"}
+	}
+
+	cs := map[string]interface{}{
+		"setting":       opts.settingName,
+		"enforced":      true,
+		"source":        "jwt",
+		"jwtClaimPath":  claimPath,
+		"jwtHeaderName": "X-Token",
+		"jwtVerify":     "jwks",
+		"jwtJwksUrl":    opts.jwksURL,
+	}
+	if opts.claimJoin != "" {
+		cs["jwtClaimJoin"] = opts.claimJoin
+	}
+	if opts.onMissing != "" {
+		cs["onMissing"] = opts.onMissing
+	}
+	if opts.issuer != "" {
+		cs["jwtIssuer"] = opts.issuer
+	}
+	if opts.audience != "" {
+		cs["jwtAudience"] = opts.audience
+	}
+
+	csJSON, _ := json.Marshal([]map[string]interface{}{cs})
 	jsonData := fmt.Sprintf(
 		`{"host":%q,"port":%s,"username":%q,"protocol":%q,"enforceReadOnly":true,"queryTimeout":"10","dialTimeout":"10","customSettings":%s}`,
 		host, port, username, proto, string(csJSON),
@@ -456,12 +502,253 @@ func makeJWTDSSettings(t *testing.T, protocol clickhouse_sql.Protocol, settingNa
 	}
 }
 
-// TestEnforcedSettingsJWTBinding_E2E is an integration test for JWT-sourced enforced settings.
-// It uses a locally-signed RS256 JWT and an ephemeral JWKS server so no live IdP is needed,
-// but it does require a running ClickHouse instance.
+// jwksPlaintextServer starts a plaintext httptest.Server that serves the JWK
+// Set for the shared testRSAKey. Plaintext (not TLS) is deliberate: the
+// plugin owns its JWKS HTTP client internally (see newJWKSHTTPClient) and
+// today does not enforce HTTPS on jwtJwksUrl, so http://127.0.0.1:PORT is
+// accepted end-to-end. If HTTPS-required is ever added to jwtJwksUrl, this
+// test must switch to injecting a cert-trusting HTTP client into the plugin.
+func jwksPlaintextServer(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+	jwksData := buildJWKSJSON(testRSAKeyID, &testRSAKey.PublicKey)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(jwksData)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, srv.URL
+}
+
+// jwtEnforcedCtx mirrors headerEnforcedCtx but injects a JWT into the X-Token
+// header. The token is passed with the "Bearer " prefix to exercise the
+// prefix-stripping code path in jwtValueSource.Resolve.
+func jwtEnforcedCtx(t *testing.T, plugin *Clickhouse, token string, dsSettings backend.DataSourceInstanceSettings) context.Context {
+	t.Helper()
+	headers := map[string]string{}
+	if token != "" {
+		headers["X-Token"] = "Bearer " + token
+	}
+	return headerEnforcedCtx(t, plugin, headers, dsSettings)
+}
+
+// signBearerToken signs claims with testRSAKey using RS256 and testRSAKeyID.
+// Adds iat automatically; callers add exp/nbf as needed.
+func signBearerToken(t *testing.T, claims jwt.MapClaims) string {
+	t.Helper()
+	if _, ok := claims["iat"]; !ok {
+		claims["iat"] = time.Now().Unix()
+	}
+	return makeRSAToken(t, claims, testRSAKey, testRSAKeyID)
+}
+
+// TestEnforcedSettingsJWTBinding_E2E is an integration test for JWT-sourced
+// enforced settings. It uses locally-signed RS256 JWTs and an in-process JWKS
+// server (no live IdP needed) but does require a running ClickHouse instance
+// with custom_visible_tenants declared (see config/admin.xml, config/custom.xml).
 func TestEnforcedSettingsJWTBinding_E2E(t *testing.T) {
-	_ = makeJWTDSSettings // suppress "unused" warning when inspecting build output
-	// This test intentionally does nothing beyond compiling; running it requires
-	// a live ClickHouse, so it is gated by the "integration" build tag.
-	t.Skip("JWT integration test requires a live ClickHouse — run with a configured server")
+	for protoName, proto := range Protocols {
+		protoName, proto := protoName, proto
+		t.Run(protoName, func(t *testing.T) {
+			t.Parallel()
+
+			const settingName = "custom_visible_tenants"
+			_, jwksURL := jwksPlaintextServer(t)
+
+			// ── HappyPath: signed token, tenants: "t1,t2" ───────────────────────────
+			t.Run("HappyPath_ValidToken_RoundTrip", func(t *testing.T) {
+				dsSettings := makeJWTDSSettings(t, proto, jwtDSOpts{
+					settingName: settingName, jwksURL: jwksURL, onMissing: onMissingReject,
+				})
+				plugin, db := openEnforcedDB(t, dsSettings)
+
+				token := signBearerToken(t, jwt.MapClaims{
+					"sub":     "user-42",
+					"tenants": "t1,t2",
+					"exp":     time.Now().Add(time.Hour).Unix(),
+				})
+				ctx := jwtEnforcedCtx(t, plugin, token, dsSettings)
+
+				var got string
+				err := db.QueryRowContext(ctx, "SELECT getSetting('custom_visible_tenants')").Scan(&got)
+				require.NoError(t, err)
+				assert.Equal(t, "t1,t2", got)
+			})
+
+			// ── ArrayClaim: tenants: ["t1","t2"] joined by "," ──────────────────────
+			t.Run("ArrayClaim_JoinedIntoCsv", func(t *testing.T) {
+				dsSettings := makeJWTDSSettings(t, proto, jwtDSOpts{
+					settingName: settingName, jwksURL: jwksURL,
+					claimJoin: ",", onMissing: onMissingReject,
+				})
+				plugin, db := openEnforcedDB(t, dsSettings)
+
+				token := signBearerToken(t, jwt.MapClaims{
+					"sub":     "user-42",
+					"tenants": []string{"t1", "t2"},
+					"exp":     time.Now().Add(time.Hour).Unix(),
+				})
+				ctx := jwtEnforcedCtx(t, plugin, token, dsSettings)
+
+				var got string
+				err := db.QueryRowContext(ctx, "SELECT getSetting('custom_visible_tenants')").Scan(&got)
+				require.NoError(t, err)
+				assert.Equal(t, "t1,t2", got)
+			})
+
+			// ── RowPolicy smoke: verify tenant-scoping guarantee via a row policy ──
+			t.Run("RowPolicySmoke", func(t *testing.T) {
+				dsSettings := makeJWTDSSettings(t, proto, jwtDSOpts{
+					settingName: settingName, jwksURL: jwksURL, onMissing: onMissingReject,
+				})
+				plugin, db := openEnforcedDB(t, dsSettings)
+
+				// Use a direct (admin) connection without enforced settings for DDL.
+				ctx := context.Background()
+				adminConn := setupConnection(t, proto, nil)
+				defer adminConn.Close()
+
+				table := "test_enforced_jwt_rp_table_" + protoName
+				policy := "test_enforced_jwt_rp_policy_" + protoName
+
+				_, err := adminConn.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+				require.NoError(t, err)
+				_, err = adminConn.ExecContext(ctx,
+					fmt.Sprintf("CREATE TABLE %s (tenant_id String, value Int32) ENGINE=MergeTree ORDER BY tenant_id", table))
+				require.NoError(t, err)
+				t.Cleanup(func() {
+					_, _ = adminConn.ExecContext(ctx, fmt.Sprintf("DROP ROW POLICY IF EXISTS %s ON %s", policy, table))
+					_, _ = adminConn.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+				})
+
+				for _, row := range []struct {
+					tenant string
+					val    int
+				}{{"t1", 1}, {"t2", 2}, {"t3", 3}} {
+					_, err = adminConn.ExecContext(ctx,
+						fmt.Sprintf("INSERT INTO %s VALUES ('%s', %d)", table, row.tenant, row.val))
+					require.NoError(t, err)
+				}
+
+				_, err = adminConn.ExecContext(ctx, fmt.Sprintf(
+					"CREATE ROW POLICY IF NOT EXISTS %s ON %s USING has(splitByChar(',', getSetting('custom_visible_tenants')), tenant_id) TO ALL",
+					policy, table,
+				))
+				if err != nil {
+					if strings.Contains(err.Error(), "ACCESS_ENTITY_ALREADY_EXISTS") ||
+						strings.Contains(err.Error(), "Not enough privileges") ||
+						strings.Contains(err.Error(), "ACCESS_DENIED") {
+						t.Skipf("cannot create row policy (privilege denied): %v", err)
+					}
+					require.NoError(t, err, "create row policy")
+				}
+
+				token := signBearerToken(t, jwt.MapClaims{
+					"sub":     "user-42",
+					"tenants": "t1,t2",
+					"exp":     time.Now().Add(time.Hour).Unix(),
+				})
+				qCtx := jwtEnforcedCtx(t, plugin, token, dsSettings)
+				rows, err := db.QueryContext(qCtx, fmt.Sprintf("SELECT tenant_id FROM %s ORDER BY tenant_id", table))
+				require.NoError(t, err)
+				defer rows.Close()
+				var tenants []string
+				for rows.Next() {
+					var tid string
+					require.NoError(t, rows.Scan(&tid))
+					tenants = append(tenants, tid)
+				}
+				require.NoError(t, rows.Err())
+				assert.Equal(t, []string{"t1", "t2"}, tenants,
+					"row policy should filter to only tenants encoded in the JWT")
+			})
+
+			// ── TokenMissing_Reject: no X-Token, OnMissing=reject → downstream err ──
+			t.Run("TokenMissing_Reject", func(t *testing.T) {
+				dsSettings := makeJWTDSSettings(t, proto, jwtDSOpts{
+					settingName: settingName, jwksURL: jwksURL, onMissing: onMissingReject,
+				})
+				plugin, _ := openEnforcedDB(t, dsSettings)
+
+				req := &backend.QueryDataRequest{
+					PluginContext: backend.PluginContext{DataSourceInstanceSettings: &dsSettings},
+					Headers:       map[string]string{},
+					Queries:       []backend.DataQuery{{JSON: []byte(`{"rawSql":"SELECT 1"}`)}},
+				}
+				ctx, _ := plugin.MutateQueryData(context.Background(), req)
+				q := &sqlutil.Query{RawSQL: "SELECT 1"}
+				_, interpErr := interpolateMacros(ctx, q, nil)
+				require.Error(t, interpErr)
+				assert.True(t, backend.IsDownstreamError(interpErr))
+				assert.Contains(t, interpErr.Error(), settingName)
+			})
+
+			// ── WrongSignature: token signed with a key not in the JWKS ─────────────
+			t.Run("WrongSignature_HardReject", func(t *testing.T) {
+				dsSettings := makeJWTDSSettings(t, proto, jwtDSOpts{
+					settingName: settingName, jwksURL: jwksURL, onMissing: onMissingReject,
+				})
+				plugin, _ := openEnforcedDB(t, dsSettings)
+
+				otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
+				require.NoError(t, err)
+				token := makeRSAToken(t, jwt.MapClaims{
+					"sub":     "user-42",
+					"tenants": "t1,t2",
+					"exp":     time.Now().Add(time.Hour).Unix(),
+					"iat":     time.Now().Unix(),
+				}, otherKey, testRSAKeyID) // same kid, wrong key
+
+				ctx := jwtEnforcedCtx(t, plugin, token, dsSettings)
+				q := &sqlutil.Query{RawSQL: "SELECT 1"}
+				_, interpErr := interpolateMacros(ctx, q, nil)
+				require.Error(t, interpErr, "verify=jwks must hard-fail on wrong signature")
+				assert.True(t, backend.IsDownstreamError(interpErr))
+			})
+
+			// ── ExpiredToken under verify=jwks: rejected regardless of onMissing ────
+			t.Run("ExpiredToken_Rejected_UnderVerifyJWKS", func(t *testing.T) {
+				// Use OnMissing=empty to prove the rejection isn't just OnMissing.
+				dsSettings := makeJWTDSSettings(t, proto, jwtDSOpts{
+					settingName: settingName, jwksURL: jwksURL, onMissing: onMissingEmpty,
+				})
+				plugin, _ := openEnforcedDB(t, dsSettings)
+
+				token := signBearerToken(t, jwt.MapClaims{
+					"sub":     "user-42",
+					"tenants": "t1,t2",
+					"exp":     time.Now().Add(-time.Hour).Unix(),
+					"iat":     time.Now().Add(-2 * time.Hour).Unix(),
+				})
+				ctx := jwtEnforcedCtx(t, plugin, token, dsSettings)
+				q := &sqlutil.Query{RawSQL: "SELECT 1"}
+				_, interpErr := interpolateMacros(ctx, q, nil)
+				require.Error(t, interpErr, "expired token under verify=jwks must hard-fail")
+				assert.True(t, backend.IsDownstreamError(interpErr))
+			})
+
+			// ── ReadonlyStillBlocksOverride: valid token, user SETTINGS override ───
+			t.Run("ReadonlyStillBlocksOverride", func(t *testing.T) {
+				dsSettings := makeJWTDSSettings(t, proto, jwtDSOpts{
+					settingName: settingName, jwksURL: jwksURL, onMissing: onMissingReject,
+				})
+				plugin, db := openEnforcedDB(t, dsSettings)
+
+				token := signBearerToken(t, jwt.MapClaims{
+					"sub":     "user-42",
+					"tenants": "t1,t2",
+					"exp":     time.Now().Add(time.Hour).Unix(),
+				})
+				ctx := jwtEnforcedCtx(t, plugin, token, dsSettings)
+
+				rows, err := db.QueryContext(ctx,
+					"SELECT 1 SETTINGS custom_visible_tenants='evil'")
+				if rows != nil {
+					rows.Close()
+				}
+				require.Error(t, err, "inline SETTINGS override should fail under readonly=1")
+				assert.Contains(t, strings.ToLower(err.Error()), "readonly",
+					"expected a READONLY (164) error; got: %v", err)
+			})
+		})
+	}
 }
