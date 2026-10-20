@@ -23,6 +23,11 @@ func NewDatasource(ctx context.Context, settings backend.DataSourceInstanceSetti
 	pluginSettings := clickhousePlugin.Settings(ctx, settings)
 	if pluginSettings.ForwardHeaders {
 		ds.EnableMultipleConnections = true
+		// Forwarded headers produce one pool per distinct header set;
+		// close pools that stop being used instead of keeping them forever.
+		ds.ConnectionCacheFactory = func() sqlds.ConnectionCache {
+			return newIdleTTLCache(connectionIdleTTL)
+		}
 	}
 
 	return ds.NewDatasource(ctx, settings)

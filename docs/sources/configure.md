@@ -280,7 +280,7 @@ When the toggle is on, the following headers are forwarded on each ClickHouse co
 
 ### Connection pool implications
 
-With header forwarding enabled, connections are keyed by the forwarded header set, which means each distinct Grafana user opens their own ClickHouse connection. Expect the connection count to scale with concurrent unique users and size `max_connections` on your ClickHouse server accordingly.
+With header forwarding enabled, the plugin keeps one connection pool per distinct set of forwarded header values, not per Grafana user. A changed dashboard or panel header, or a changed forwarded credential, creates a new pool. Each pool uses memory and goroutines, so the plugin closes a pool that has not been used for 15 minutes. Memory therefore tracks the header sets used in that window, not every set seen since the data source was loaded. Idle ClickHouse connections also close under your connection lifetime settings, so server-side connection counts are lower than the number of pools. Size `max_connections` on your ClickHouse server for the number of concurrent unique header sets.
 
 ### Custom headers
 
